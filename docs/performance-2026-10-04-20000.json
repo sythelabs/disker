@@ -1,0 +1,112 @@
+{
+  "buildConfiguration": "release",
+  "cacheAllocatedBytes": 36528128,
+  "cacheLogicalBytes": 36524720,
+  "cachedChildrenReturned": 100,
+  "filesystemCacheState": "Warm OS filesystem caches; fixture files were just created; caches were not purged",
+  "fixtureCreationSeconds": 1.64428825,
+  "fixtureFiles": 20000,
+  "freshProcessCachedQuerySeconds": 0.007239708,
+  "fullScan": {
+    "allocatedBytes": 82427904,
+    "isComplete": true,
+    "issues": [],
+    "lastScanDate": "2026-10-04T08:45:33Z",
+    "logicalBytes": 40722160,
+    "metrics": {
+      "bulkCalls": 316,
+      "contentBytesRead": 0,
+      "directories": 158,
+      "entries": 20158,
+      "metadataCalls": 317
+    },
+    "nodeCount": 20158,
+    "revision": 1,
+    "root": "/var/folders/w5/gyzp1kcd0sj6j4g3mh4fyr4m0000gn/T/disker-benchmark-39A57144-F124-4D32-A0A2-9CC492A2AF91/fixture"
+  },
+  "fullScanNodesPerSecond": 67679.18528469585,
+  "fullScanSeconds": 0.297846375,
+  "peakResidentBytes": 80805888,
+  "provenance": {
+    "benchmarkExecutableSHA256": "22637561f6248cdec09829be520329b98295208f01795307abac247d03d6e0fa",
+    "command": "just benchmark 20000",
+    "exitStatus": 0,
+    "hardware": {
+      "logicalCPUCount": 10,
+      "memoryBytes": 34359738368,
+      "model": "Mac17,2",
+      "processor": "Apple M5"
+    },
+    "operatingSystem": {
+      "build": "25F84",
+      "name": "macOS",
+      "version": "26.5.2"
+    },
+    "recordedAtUTC": "2026-10-04T09:18:54.659978+00:00",
+    "sourceFilesSHA256": {
+      "Package.swift": "442ce8a08efe93e96cf2960474a556a4c4979ab036781b9761c4af24734185ba",
+      "Sources/CDiskerScan/CDiskerScan.c": "861bcc11e4b000fdd39735583b532b326d47428c2e0b8be88e3c33e1bb57afb9",
+      "Sources/CDiskerScan/include/CDiskerScan.h": "c437a6853c6dcf69da68c70da401ff2052ce1f46ef0600ba1a3ffd2b01d0707e",
+      "Sources/DiskerCore/DirectoryScanner.swift": "bb6bb711d14ce5e288a561fb00ae7c49ed730c2c90aec495e452a85c5241ecc6",
+      "Sources/DiskerCore/DiskIndex.swift": "a5d29d3068e93a7296bc414710513c013452ca7d2ebfef67f8c18d7897a93028",
+      "Sources/DiskerCore/FileEventJournal.swift": "9fff980167c4397f3f624c0a92b07c1188772eee9c7eedd4ccc828efb078538d",
+      "Sources/DiskerCore/FileMetadata.swift": "c37ac167232c84248213d7e430824069a412d1db8ae7f07b87a61fc7a35e9662",
+      "Sources/DiskerCore/GitInspector.swift": "2157805c0087e467f6cc75180772f697afcca30aaa669f8b8f73df2cc472103e",
+      "Sources/DiskerCore/IndexTypes.swift": "270e7e48a7b6197c97c1d84b7e5b367fac801f43af94c0345ffad492005f96c6",
+      "Sources/DiskerCore/MetadataCoding.swift": "ef9e8e4b0526c517ab7882a1d51e4812fc829dd39c9aab1bab01a40f1bd5560f",
+      "Sources/DiskerIndexCLI/BenchmarkCommand.swift": "52d49bbb2f0e7df0fc2b9beec5e5372ed337957008a39b71f4945873e785677c",
+      "Sources/DiskerIndexCLI/DiskerIndexCommand.swift": "5e90fdb66ebad30bfdab4be7c0b5bb3d64fc30929e14ee54791057e61fb1d53a",
+      "justfile": "387cd50057d07702fb642de73fe570250df1e0ec078013098ed58bb15fce2c2b"
+    },
+    "toolchain": {
+      "developerDirectory": "/Applications/Xcode.app/Contents/Developer",
+      "just": "just 1.58.0",
+      "macOSSDKPath": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+      "macOSSDKVersion": "26.5",
+      "swift": "swift-driver version: 1.148.6 Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)\nTarget: arm64-apple-macosx26.0",
+      "xcode": "Xcode 26.6\nBuild version 17F113"
+    }
+  },
+  "refreshConsistency": "FSEvents updates converge asynchronously; refresh is not an atomic live filesystem snapshot",
+  "reopenAndQuerySeconds": 0.001332375,
+  "resizeRefreshAttempts": 2,
+  "root": "/var/folders/w5/gyzp1kcd0sj6j4g3mh4fyr4m0000gn/T/disker-benchmark-39A57144-F124-4D32-A0A2-9CC492A2AF91/fixture",
+  "singleFileResize": {
+    "allocatedBytes": 82432000,
+    "isComplete": true,
+    "issues": [],
+    "lastScanDate": "2026-10-04T08:45:33Z",
+    "logicalBytes": 40730320,
+    "metrics": {
+      "bulkCalls": 2,
+      "contentBytesRead": 0,
+      "directories": 1,
+      "entries": 129,
+      "metadataCalls": 2
+    },
+    "nodeCount": 20158,
+    "revision": 4,
+    "root": "/var/folders/w5/gyzp1kcd0sj6j4g3mh4fyr4m0000gn/T/disker-benchmark-39A57144-F124-4D32-A0A2-9CC492A2AF91/fixture"
+  },
+  "singleFileResizeConvergenceSeconds": 0.193600709,
+  "singleFileResizeRefreshSeconds": 0.018320166,
+  "unchangedRefresh": {
+    "allocatedBytes": 82427904,
+    "isComplete": true,
+    "issues": [],
+    "lastScanDate": "2026-10-04T08:45:33Z",
+    "logicalBytes": 40722160,
+    "metrics": {
+      "bulkCalls": 0,
+      "contentBytesRead": 0,
+      "directories": 0,
+      "entries": 0,
+      "metadataCalls": 0
+    },
+    "nodeCount": 20158,
+    "revision": 2,
+    "root": "/var/folders/w5/gyzp1kcd0sj6j4g3mh4fyr4m0000gn/T/disker-benchmark-39A57144-F124-4D32-A0A2-9CC492A2AF91/fixture"
+  },
+  "unchangedRefreshSeconds": 0.010574416,
+  "verificationFailures": []
+}

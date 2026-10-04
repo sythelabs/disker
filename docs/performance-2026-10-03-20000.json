@@ -1,0 +1,80 @@
+{
+  "buildConfiguration" : "release",
+  "cacheAllocatedBytes" : 36536320,
+  "cacheLogicalBytes" : 36532960,
+  "cachedChildrenReturned" : 100,
+  "filesystemCacheState" : "Warm OS filesystem caches; fixture files were just created; caches were not purged",
+  "fixtureCreationSeconds" : 1.499821875,
+  "fixtureFiles" : 20000,
+  "freshProcessCachedQuerySeconds" : 0.008202458,
+  "fullScan" : {
+    "allocatedBytes" : 82427904,
+    "isComplete" : true,
+    "issues" : [
+
+    ],
+    "lastScanDate" : "2026-10-04T04:56:00Z",
+    "logicalBytes" : 40722160,
+    "metrics" : {
+      "bulkCalls" : 316,
+      "contentBytesRead" : 0,
+      "directories" : 158,
+      "entries" : 20158,
+      "metadataCalls" : 317
+    },
+    "nodeCount" : 20158,
+    "revision" : 1,
+    "root" : "\/var\/folders\/w5\/gyzp1kcd0sj6j4g3mh4fyr4m0000gn\/T\/disker-benchmark-A2FFB07C-A13D-4DB9-9F5A-19CAAD914176\/fixture"
+  },
+  "fullScanNodesPerSecond" : 32217.579741826234,
+  "fullScanSeconds" : 0.62568325,
+  "peakResidentBytes" : 80871424,
+  "refreshConsistency" : "FSEvents updates converge asynchronously; refresh is not an atomic live filesystem snapshot",
+  "reopenAndQuerySeconds" : 0.028858708,
+  "resizeRefreshAttempts" : 2,
+  "root" : "\/var\/folders\/w5\/gyzp1kcd0sj6j4g3mh4fyr4m0000gn\/T\/disker-benchmark-A2FFB07C-A13D-4DB9-9F5A-19CAAD914176\/fixture",
+  "singleFileResize" : {
+    "allocatedBytes" : 82432000,
+    "isComplete" : true,
+    "issues" : [
+
+    ],
+    "lastScanDate" : "2026-10-04T04:56:00Z",
+    "logicalBytes" : 40730320,
+    "metrics" : {
+      "bulkCalls" : 2,
+      "contentBytesRead" : 0,
+      "directories" : 1,
+      "entries" : 129,
+      "metadataCalls" : 2
+    },
+    "nodeCount" : 20158,
+    "revision" : 4,
+    "root" : "\/var\/folders\/w5\/gyzp1kcd0sj6j4g3mh4fyr4m0000gn\/T\/disker-benchmark-A2FFB07C-A13D-4DB9-9F5A-19CAAD914176\/fixture"
+  },
+  "singleFileResizeConvergenceSeconds" : 0.030484292,
+  "singleFileResizeRefreshSeconds" : 0.011475166,
+  "unchangedRefresh" : {
+    "allocatedBytes" : 82427904,
+    "isComplete" : true,
+    "issues" : [
+
+    ],
+    "lastScanDate" : "2026-10-04T04:56:00Z",
+    "logicalBytes" : 40722160,
+    "metrics" : {
+      "bulkCalls" : 0,
+      "contentBytesRead" : 0,
+      "directories" : 0,
+      "entries" : 0,
+      "metadataCalls" : 0
+    },
+    "nodeCount" : 20158,
+    "revision" : 2,
+    "root" : "\/var\/folders\/w5\/gyzp1kcd0sj6j4g3mh4fyr4m0000gn\/T\/disker-benchmark-A2FFB07C-A13D-4DB9-9F5A-19CAAD914176\/fixture"
+  },
+  "unchangedRefreshSeconds" : 0.006010333,
+  "verificationFailures" : [
+
+  ]
+}
