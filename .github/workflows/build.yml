@@ -1,0 +1,78 @@
+name: Build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install just
+        run: brew install just
+      - name: Test
+        run: just test
+      - name: Build the universal release app
+        run: just release
+      - name: Verify the app bundle
+        run: |
+          plutil -lint .build/Disker.app/Contents/Info.plist
+          test -f .build/Disker.app/Contents/Resources/GRDB_GRDB.bundle/Contents/Resources/PrivacyInfo.xcprivacy
+          lipo .build/Disker.app/Contents/MacOS/Disker -verify_arch arm64 x86_64
+          codesign --verify --deep --strict --verbose=2 .build/Disker.app
+      - name: Package the app
+        id: package
+        run: |
+          version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' .build/Disker.app/Contents/Info.plist)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent .build/Disker.app "dist/Disker-$version-macOS-universal.zip"
+          cd dist
+          shasum -a 256 Disker-*.zip > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Disker-macOS-universal
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: Disker-macOS-universal
+          path: dist
+      - name: Publish the versioned build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build-and-test.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS.txt
+          gh release create "v$VERSION" Disker-*.zip SHA256SUMS.txt \
+            --target "$COMMIT_SHA" --title "Disker $VERSION" --generate-notes

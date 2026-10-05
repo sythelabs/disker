@@ -3,10 +3,19 @@ set positional-arguments
 
 build:
     swift build --product Disker
+    just _bundle "$(swift build --show-bin-path)/Disker"
+
+release:
+    swift build -c release --product Disker --arch arm64 --arch x86_64
+    just _bundle "$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/Disker"
+
+[private]
+_bundle binary:
     mkdir -p .build/Disker.app/Contents/MacOS .build/Disker.app/Contents/Resources
-    cp "$(swift build --show-bin-path)/Disker" .build/Disker.app/Contents/MacOS/Disker
+    cp "$1" .build/Disker.app/Contents/MacOS/Disker
     cp Info.plist .build/Disker.app/Contents/Info.plist
     cp Resources/Credits.rtf .build/Disker.app/Contents/Resources/Credits.rtf
+    cp -R "$(dirname "$1")"/*.bundle .build/Disker.app/Contents/Resources/
     xcrun actool Resources/AppIcon.icon --compile .build/Disker.app/Contents/Resources --app-icon AppIcon --platform macosx --minimum-deployment-target 26.0 --output-partial-info-plist .build/app-icon-info.plist
     /usr/libexec/PlistBuddy -c "Merge .build/app-icon-info.plist" .build/Disker.app/Contents/Info.plist
     codesign --force --sign - .build/Disker.app
