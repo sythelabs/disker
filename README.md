@@ -2,6 +2,16 @@
 
 Native SwiftUI disk usage app for macOS 26 and later, using Swift 6.2.
 
+## Download
+
+Download the universal macOS app from [GitHub Releases](https://github.com/sythelabs/disker/releases/latest). Builds support Apple Silicon and Intel Macs running macOS 26 or later. The app is ad-hoc signed and is not notarized.
+
+## Contributing and releases
+
+Changes to `main` require a pull request with passing `Version increase` and `Build and test` checks. Every PR must increase both `CFBundleShortVersionString` (stable `major.minor.patch`) and `CFBundleVersion` (positive integer) in `Info.plist` relative to the latest target branch. Update stale PRs after another version merges.
+
+Every push to `main` runs the Swift tests, builds and verifies a universal release app, and publishes a `v<version>` GitHub Release containing the app ZIP and SHA-256 checksums. PR builds are available as workflow artifacts. `just release` builds the same app locally at `.build/Disker.app`.
+
 ## Run
 
 ```sh

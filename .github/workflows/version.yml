@@ -1,0 +1,24 @@
+name: Version
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  version-increase:
+    name: Version increase
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test the version gate
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - name: Compare with the current target branch
+        env:
+          TARGET_BRANCH: ${{ github.base_ref || github.event.merge_group.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$TARGET_BRANCH"
+          python3 .github/scripts/check_version.py FETCH_HEAD
