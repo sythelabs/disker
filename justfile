@@ -3,9 +3,11 @@ set positional-arguments
 
 build:
     swift build --product Disker
-    mkdir -p .build/Disker.app/Contents/MacOS
+    mkdir -p .build/Disker.app/Contents/MacOS .build/Disker.app/Contents/Resources
     cp "$(swift build --show-bin-path)/Disker" .build/Disker.app/Contents/MacOS/Disker
     cp Info.plist .build/Disker.app/Contents/Info.plist
+    xcrun actool Resources/AppIcon.icon --compile .build/Disker.app/Contents/Resources --app-icon AppIcon --platform macosx --minimum-deployment-target 26.0 --output-partial-info-plist .build/app-icon-info.plist
+    /usr/libexec/PlistBuddy -c "Merge .build/app-icon-info.plist" .build/Disker.app/Contents/Info.plist
     codesign --force --sign - .build/Disker.app
 
 run: build
