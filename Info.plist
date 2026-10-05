@@ -30,5 +30,15 @@
     <string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Disker scans your Desktop to show how much disk space its files and folders use.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Disker scans your Documents to show how much disk space its files and folders use.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Disker scans your Downloads to show how much disk space its files and folders use.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Disker scans network volumes to measure file and folder disk usage.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Disker scans removable volumes to measure file and folder disk usage.</string>
 </dict>
 </plist>
