@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var locations: SidebarLocations
     @State private var sidebarSelection: SidebarSelection?
     @State private var selection: DiskTreeRowID?
+    @State private var searchText: String = ""
     @State private var choosingFolder: Bool = false
     @State private var showingIssues: Bool = false
     @State private var folderPickerError: String?
@@ -41,7 +42,22 @@ struct ContentView: View {
             }
             .navigationTitle(rootTitle)
             .navigationSubtitle(model.rootPath)
+            .searchable(text: $searchText, placement: .toolbar, prompt: "Search expanded folders")
             .toolbar {
+                ToolbarItemGroup(placement: .navigation) {
+                    Button("Back", systemImage: "chevron.left") {
+                        Task { await model.goBack() }
+                    }
+                    .disabled(!model.canGoBack)
+                    .keyboardShortcut("[", modifiers: .command)
+                    .help("Go to the previous folder")
+                    Button("Forward", systemImage: "chevron.right") {
+                        Task { await model.goForward() }
+                    }
+                    .disabled(!model.canGoForward)
+                    .keyboardShortcut("]", modifiers: .command)
+                    .help("Go to the next folder")
+                }
                 ToolbarItemGroup {
                     Button("Choose Folder", systemImage: "folder") { choosingFolder = true }
                         .help("Choose the root of the file tree")
@@ -114,10 +130,15 @@ struct ContentView: View {
             catch { fileOperationError = error.localizedDescription }
         }
         .onDisappear { model.cancelScan() }
+        .onChange(of: model.rootPath) { _, _ in
+            selection = nil
+            searchText = ""
+        }
+        .onChange(of: searchText) { _, _ in selection = nil }
     }
 
     private var tree: some View {
-        Table(model.rows, selection: $selection) {
+        Table(visibleRows, selection: $selection) {
             TableColumn("Name") { row in
                 TreeNameCell(row: row, model: model)
             }
@@ -179,7 +200,7 @@ struct ContentView: View {
                   let row: DiskTreeRow = model.rows.first(where: { $0.id == selection }),
                   row.node?.entry.metadata.kind == .directory else { return .ignored }
             if model.expanded.contains(path) {
-                if let child: DiskTreeRow = model.rows.first(where: { $0.node?.entry.parentPath == path }) { selection = child.id }
+                if let child: DiskTreeRow = visibleRows.first(where: { $0.node?.entry.parentPath == path }) { selection = child.id }
             } else { Task { await model.toggle(path) } }
             return .handled
         }
@@ -193,8 +214,10 @@ struct ContentView: View {
         }
         .onKeyPress(phases: .down, action: handleFileKeyPress)
         .overlay {
-            if model.rows.isEmpty {
-                if model.isScanning {
+            if visibleRows.isEmpty {
+                if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    ContentUnavailableView("No matching files or folders", systemImage: "magnifyingglass", description: Text("Try a different search in the expanded folders."))
+                } else if model.isScanning {
                     VStack(spacing: 12) { ProgressView(); Text("Reading file tree").foregroundStyle(.secondary) }
                 } else {
                     ContentUnavailableView(model.scanStopped ? "Scan stopped" : "No indexed files", systemImage: "folder", description: Text("Choose a folder or refresh to read its file tree."))
@@ -202,6 +225,8 @@ struct ContentView: View {
             }
         }
     }
+
+    private var visibleRows: [DiskTreeRow] { searchTreeRows(model.rows, query: searchText) }
 
     private var blockingIssues: [ScanIssue] {
         model.summary?.issues.filter { ![.excluded, .directoryAlias, .mountBoundary].contains($0.kind) } ?? []

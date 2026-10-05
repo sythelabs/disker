@@ -38,6 +38,21 @@ enum DiskTreeRow: Identifiable {
     }
 }
 
+func searchTreeRows(_ rows: [DiskTreeRow], query: String) -> [DiskTreeRow] {
+    let text: String = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return rows }
+    var parents: Set<Data> = []
+    var matches: [DiskTreeRow] = []
+    for row: DiskTreeRow in rows.reversed() {
+        guard let node: IndexedNode = row.node else { continue }
+        let name: String = String(decoding: node.entry.name, as: UTF8.self)
+        guard parents.contains(node.entry.path) || name.range(of: text, options: [.caseInsensitive, .diacriticInsensitive]) != nil else { continue }
+        matches.append(row)
+        if let parent: Data = node.entry.parentPath { parents.insert(parent) }
+    }
+    return Array(matches.reversed())
+}
+
 private struct ChildPage {
     let nodes: [IndexedNode]
     let hasMore: Bool
@@ -57,6 +72,8 @@ final class DiskTreeModel {
     private(set) var loading: Set<Data> = []
     private var rootNode: IndexedNode?
     private var pages: [Data: ChildPage] = [:]
+    private var backPaths: [String] = []
+    private var forwardPaths: [String] = []
     private let cacheURL: URL
     @ObservationIgnored private var index: DiskIndex?
     @ObservationIgnored private var generation: UInt64 = 0
@@ -87,6 +104,10 @@ final class DiskTreeModel {
         return result
     }
 
+    var canGoBack: Bool { !backPaths.isEmpty }
+
+    var canGoForward: Bool { !forwardPaths.isEmpty }
+
     func start() async {
         if index != nil { return }
         let ticket: UInt64 = generation
@@ -104,13 +125,33 @@ final class DiskTreeModel {
     }
 
     func chooseRoot(_ url: URL) async {
+        let path: String = url.standardizedFileURL.path
+        guard path != rootPath else { return }
+        backPaths.append(rootPath)
+        forwardPaths = []
+        await loadRoot(path)
+    }
+
+    func goBack() async {
+        guard let path: String = backPaths.popLast() else { return }
+        forwardPaths.append(rootPath)
+        await loadRoot(path)
+    }
+
+    func goForward() async {
+        guard let path: String = forwardPaths.popLast() else { return }
+        backPaths.append(rootPath)
+        await loadRoot(path)
+    }
+
+    private func loadRoot(_ path: String) async {
         cancelScan()
         generation += 1
         isScanning = false
         isWaitingForWriter = false
         scanTask = nil
         scanBuffer = nil
-        rootPath = url.standardizedFileURL.path
+        rootPath = path
         expanded = [Data(rootPath.utf8)]
         pages = [:]
         loading = []
