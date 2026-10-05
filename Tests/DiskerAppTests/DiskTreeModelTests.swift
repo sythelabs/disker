@@ -105,6 +105,29 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(node.subtreeNodeCount == 2)
     }
 
+    @Test func previewSizeUpdatesDoNotMoveFoldersBetweenClicks() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let firstFolder: URL = fixture.root.appendingPathComponent("first")
+        let secondFolder: URL = fixture.root.appendingPathComponent("second")
+        try treeFiles(directory: firstFolder, count: 1, bytes: 4_096)
+        try treeFiles(directory: secondFolder, count: 1, bytes: 32_768)
+        let index: DiskIndex = try await cachedTree(fixture: fixture)
+        let root: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(fixture.root.path.utf8))).entry
+        let first: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(firstFolder.path.utf8))).entry
+        let second: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(secondFolder.path.utf8))).entry
+        let firstFile: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(firstFolder.appendingPathComponent("file-0").path.utf8))).entry
+        let secondFile: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(secondFolder.appendingPathComponent("file-0").path.utf8))).entry
+        let buffer: TreeScanBuffer = TreeScanBuffer(root: root.path, capturePreview: true, limit: 500)
+        buffer.receive(.batch([root, first, second, firstFile]))
+        let before: [Data] = buffer.snapshot().nodes.map(\.entry.path)
+
+        buffer.receive(.batch([secondFile]))
+        let after: TreeScanPreview = buffer.snapshot()
+        #expect(after.nodes.map(\.entry.path) == before, "Growing sizes moved a different folder into the row being clicked")
+        #expect(after.nodes.last?.subtreeAllocatedBytes == secondFile.metadata.allocatedBytes + second.metadata.allocatedBytes)
+    }
+
     @Test func nestedFoldersAndFilesCollapseAndReexpandWithParentProportions() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
@@ -158,6 +181,68 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.rows.contains { $0.node?.entry.path == Data(folder.path.utf8) })
         #expect(model.rows.filter { $0.node?.entry.metadata.kind == .regularFile }.count == 500)
         #expect(!model.rows.contains { $0.id == .more(Data(fixture.root.path.utf8)) })
+    }
+
+    @Test(arguments: [0, 3])
+    func expandedRowsRemainVisibleWhileRefreshReloadsTheSnapshot(addedFileCount: Int) async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let folder: URL = fixture.root.appendingPathComponent("folder")
+        try treeFiles(directory: folder, count: 2, bytes: 4_096)
+        let index: DiskIndex = try await cachedTree(fixture: fixture)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        await model.start()
+        try await waitForTreeScan(model)
+        await model.toggle(Data(folder.path.utf8))
+        let selected: DiskTreeRowID = .node(Data(folder.appendingPathComponent("file-1").path.utf8))
+        #expect(model.rows.contains { $0.id == selected })
+        if addedFileCount > 0 {
+            try treeFiles(directory: fixture.root, count: addedFileCount, bytes: 4_096)
+            _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        }
+
+        model.refresh()
+        let deadline: Date = Date().addingTimeInterval(5)
+        var missingSelection: Bool = false
+        while model.isScanning && Date() < deadline {
+            if !model.rows.contains(where: { $0.id == selected }) { missingSelection = true }
+            await Task.yield()
+        }
+        try await waitForTreeScan(model)
+        #expect(!missingSelection, "Reloading a scan temporarily removes the selected row from the native table")
+        #expect(model.rows.contains { $0.id == selected })
+        #expect(model.rows.count == 4 + addedFileCount)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test(arguments: [503, 510, 525])
+    func refreshRetainsLoadedPagesAndTheirSelectableRows(refreshedFileCount: Int) async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root, count: 510, bytes: 4_096)
+        let index: DiskIndex = try await cachedTree(fixture: fixture)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        await model.start()
+        try await waitForTreeScan(model)
+        await model.loadMore(Data(fixture.root.path.utf8))
+        let selected: DiskTreeRowID = try #require(model.rows.last).id
+        #expect(model.rows.count == 511)
+        if refreshedFileCount < 510 {
+            for number: Int in refreshedFileCount..<510 {
+                try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("file-\(number)"))
+            }
+        } else if refreshedFileCount > 510 {
+            try treeFiles(directory: fixture.root, count: refreshedFileCount, bytes: 4_096)
+        }
+        if refreshedFileCount != 510 {
+            _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        }
+
+        model.refresh()
+        try await waitForTreeScan(model)
+        #expect(model.rows.count == refreshedFileCount + 1)
+        #expect(model.rows.contains { $0.id == selected }, "Refresh discarded the page containing the selected row")
+        #expect(model.errorMessage == nil)
     }
 
     @Test func rawFilenameBytesRemainDistinctRowIdentities() async throws {

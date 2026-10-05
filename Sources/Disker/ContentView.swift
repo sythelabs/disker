@@ -18,7 +18,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             tree
             Divider()
-            status
+            TreeScanStatus(model: model, issues: blockingIssues, showingIssues: $showingIssues)
         }
         .frame(minWidth: 740, minHeight: 440)
         .navigationTitle("Disker")
@@ -137,7 +137,23 @@ struct ContentView: View {
         }
     }
 
-    private var status: some View {
+    private var blockingIssues: [ScanIssue] {
+        model.summary?.issues.filter { ![.excluded, .directoryAlias, .mountBoundary].contains($0.kind) } ?? []
+    }
+
+    private func directory(in ids: Set<DiskTreeRowID>) -> Data? {
+        guard let id: DiskTreeRowID = ids.first, let row: DiskTreeRow = model.rows.first(where: { $0.id == id }),
+              let node: IndexedNode = row.node, node.entry.metadata.kind == .directory else { return nil }
+        return node.entry.path
+    }
+}
+
+private struct TreeScanStatus: View {
+    let model: DiskTreeModel
+    let issues: [ScanIssue]
+    @Binding var showingIssues: Bool
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let error: String = model.errorMessage { Text(error).foregroundStyle(.red).textSelection(.enabled).lineLimit(3).help(error) }
             HStack {
@@ -151,8 +167,8 @@ struct ContentView: View {
                     Text(fileSize(summary.allocatedBytes) + " allocated").foregroundStyle(.secondary)
                 }
                 Spacer()
-                if !blockingIssues.isEmpty {
-                    Button("\(blockingIssues.count.formatted()) locations unavailable") { showingIssues = true }
+                if !issues.isEmpty {
+                    Button("\(issues.count.formatted()) locations unavailable") { showingIssues = true }
                         .buttonStyle(.borderless)
                 }
             }
@@ -160,16 +176,6 @@ struct ContentView: View {
         .font(.caption)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-    }
-
-    private var blockingIssues: [ScanIssue] {
-        model.summary?.issues.filter { ![.excluded, .directoryAlias, .mountBoundary].contains($0.kind) } ?? []
-    }
-
-    private func directory(in ids: Set<DiskTreeRowID>) -> Data? {
-        guard let id: DiskTreeRowID = ids.first, let row: DiskTreeRow = model.rows.first(where: { $0.id == id }),
-              let node: IndexedNode = row.node, node.entry.metadata.kind == .directory else { return nil }
-        return node.entry.path
     }
 }
 
