@@ -18,14 +18,22 @@
 - Prefer established, well-tested, widely used libraries for solved problems. Use GRDB for SQLite access; write custom code only when platform requirements or measured performance justify it.
 - Treat permission gaps and stale metadata as explicit states. Preserve raw path identity and avoid reading file contents during size scans.
 
+## File tree
+
+- Start in the user's home folder and allow retargeting through the native folder picker.
+- Show files and expandable folders with aligned size columns and proportional bars. Use native table scrolling and resizable columns.
+- Query expanded branches in bounded pages and publish scan updates in batches. Keep indexing and preview aggregation off the main actor.
+- Preserve raw byte paths as row identities and distinguish provisional scan totals from committed snapshots.
+
 ## Project
 
 - `Package.swift` defines the Swift package.
 - `Sources/Disker/DiskerApp.swift` is the app entry point.
-- `Sources/Disker/ContentView.swift` defines the starter window.
+- `Sources/Disker/ContentView.swift` defines the native file tree window.
+- `Sources/Disker/DiskTreeModel.swift` connects cached child queries and streamed scan progress to visible branches.
 - `Info.plist` defines the macOS app bundle metadata.
 - `just build` builds and ad-hoc signs `.build/Disker.app` for local development.
 - `just run` builds and launches the app.
-- `just test` runs the backend tests with the full Xcode toolchain.
+- `just test` runs the backend and file-tree model tests with the full Xcode toolchain.
 - `just index` runs the backend command-line harness; quote paths containing spaces.
 - `just benchmark 100000` measures a deterministic temporary fixture in a release build.

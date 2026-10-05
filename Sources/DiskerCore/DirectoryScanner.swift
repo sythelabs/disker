@@ -100,10 +100,12 @@ private struct DirectoryIdentity: Hashable {
 private struct DirectoryJob {
     let path: Data
     let metadata: FileMetadata
+    let progressWeight: Double
 }
 
 public enum DirectoryScanner {
     public static func scan(root: Data, options: ScanOptions, isCancelled: @Sendable () -> Bool,
+                            receiveProgress: (Double) -> Void,
                             receiveBatch: ([ScanEntry]) throws -> Void) throws -> ScanSummary {
         try validate(root: root, options: options)
         if isCancelled() { throw ScanError.cancelled }
@@ -121,8 +123,13 @@ public enum DirectoryScanner {
         var metrics: ScanMetrics = ScanMetrics(entries: 0, directories: 0, bulkCalls: 0, metadataCalls: 1, contentBytesRead: 0)
         var issues: [ScanIssue] = []
         var aliases: [ScanAlias] = []
-        var jobs: [DirectoryJob] = [DirectoryJob(path: root, metadata: rootMetadata)]
+        var jobs: [DirectoryJob] = [DirectoryJob(path: root, metadata: rootMetadata, progressWeight: 1)]
         var nextJob: Int = 0
+        var completedWeight: Double = 0
+        func completeWork(_ weight: Double) {
+            completedWeight += weight
+            receiveProgress(min(completedWeight, Double(1).nextDown))
+        }
         var visited: [DirectoryIdentity: Data] = [:]
         var batch: [ScanEntry] = []
         batch.reserveCapacity(options.batchSize)
@@ -146,6 +153,7 @@ public enum DirectoryScanner {
             let descriptor: Int32 = openRelative(rootDescriptor: rootDescriptor, path: relative)
             if descriptor < 0 {
                 issues.append(systemIssue(path: job.path, operation: "openat", code: errno))
+                completeWork(job.progressWeight)
                 continue
             }
             do {
@@ -155,12 +163,14 @@ public enum DirectoryScanner {
                 if openedError != 0 {
                     issues.append(systemIssue(path: job.path, operation: "fstat", code: openedError))
                     _ = close(descriptor)
+                    completeWork(job.progressWeight)
                     continue
                 }
                 let opened: FileMetadata = metadata(openedNative)
                 if options.mountPolicy == .sameDevice && opened.device != rootMetadata.device {
                     issues.append(ScanIssue(kind: .mountBoundary, path: job.path, operation: "descend", errnoCode: 0))
                     _ = close(descriptor)
+                    completeWork(job.progressWeight)
                     continue
                 }
                 let identity: DirectoryIdentity = DirectoryIdentity(device: opened.device, inode: opened.inode)
@@ -172,6 +182,7 @@ public enum DirectoryScanner {
                         issues.append(ScanIssue(kind: .directoryAlias, path: job.path, operation: "descend", errnoCode: 0))
                     }
                     _ = close(descriptor)
+                    completeWork(job.progressWeight)
                     continue
                 }
                 visited[identity] = job.path
@@ -180,11 +191,11 @@ public enum DirectoryScanner {
                     issues.append(ScanIssue(kind: .changedDuringScan, path: job.path, operation: "verifyDirectory", errnoCode: 0))
                 }
                 metrics.directories += 1
-                var childDirectories: [DirectoryJob] = []
+                var childDirectories: [ScanEntry] = []
                 let enumeration: ScanSummary = try enumerateOpenedDirectory(descriptor: descriptor, path: job.path, options: options,
                     buffer: buffer, isCancelled: isCancelled, receiveEntry: { entry in
                         if entry.metadata.kind == .directory {
-                            childDirectories.append(DirectoryJob(path: entry.path, metadata: entry.metadata))
+                            childDirectories.append(entry)
                         }
                         batch.append(entry)
                         metrics.entries += 1
@@ -193,7 +204,10 @@ public enum DirectoryScanner {
                             batch.removeAll(keepingCapacity: true)
                         }
                     })
-                jobs.append(contentsOf: childDirectories.sorted { $0.path.lexicographicallyPrecedes($1.path) })
+                let progressWeight: Double = job.progressWeight / Double(childDirectories.count + 1)
+                for entry: ScanEntry in childDirectories.sorted(by: { $0.path.lexicographicallyPrecedes($1.path) }) {
+                    jobs.append(DirectoryJob(path: entry.path, metadata: entry.metadata, progressWeight: progressWeight))
+                }
                 metrics.bulkCalls += enumeration.metrics.bulkCalls
                 metrics.metadataCalls += enumeration.metrics.metadataCalls
                 issues.append(contentsOf: enumeration.issues)
@@ -209,16 +223,20 @@ public enum DirectoryScanner {
                     issues.append(ScanIssue(kind: .changedDuringScan, path: job.path, operation: "verifyDirectory", errnoCode: 0))
                 }
                 _ = close(descriptor)
+                completeWork(progressWeight)
             } catch {
                 _ = close(descriptor)
                 throw error
             }
         }
         if !batch.isEmpty { try receiveBatch(batch) }
+        if isCancelled() { throw ScanError.cancelled }
+        receiveProgress(1)
         return ScanSummary(metrics: metrics, issues: issues, aliases: aliases)
     }
 
     public static func enumerateDirectory(path: Data, options: ScanOptions, isCancelled: @Sendable () -> Bool,
+                                         receiveProgress: (Double) -> Void,
                                          receiveBatch: ([ScanEntry]) throws -> Void) throws -> ScanSummary {
         try validate(root: path, options: options)
         if isCancelled() { throw ScanError.cancelled }
@@ -266,6 +284,8 @@ public enum DirectoryScanner {
             issues.append(ScanIssue(kind: .changedDuringScan, path: path, operation: "verifyDirectory", errnoCode: 0))
         }
         if !batch.isEmpty { try receiveBatch(batch) }
+        if isCancelled() { throw ScanError.cancelled }
+        receiveProgress(1)
         return ScanSummary(metrics: metrics, issues: issues, aliases: [])
     }
 

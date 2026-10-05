@@ -1,6 +1,7 @@
 import CDiskerScan
 import Darwin
 import Foundation
+import Synchronization
 import Testing
 @testable import DiskerCore
 
@@ -19,7 +20,7 @@ private func scanOptions(excludedPaths: [Data]) -> ScanOptions {
 private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: ScanSummary) {
     var entries: [ScanEntry] = []
     let summary: ScanSummary = try DirectoryScanner.scan(
-        root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }
+        root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }
     ) { batch in
         entries.append(contentsOf: batch)
     }
@@ -36,7 +37,7 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     var entries: [ScanEntry] = []
     var batchCounts: [Int] = []
     let summary: ScanSummary = try DirectoryScanner.scan(
-        root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }
+        root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }
     ) { batch in
         batchCounts.append(batch.count)
         entries.append(contentsOf: batch)
@@ -106,14 +107,14 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     try Data([1]).write(to: child.appendingPathComponent("nested"))
     var entries: [ScanEntry] = []
     let direct: ScanSummary = try DirectoryScanner.enumerateDirectory(
-        path: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }
+        path: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }
     ) { entries.append(contentsOf: $0) }
     #expect(entries.count == 2)
     #expect(direct.metrics.directories == 1)
     #expect(direct.aliases.isEmpty)
     entries.removeAll()
     let excluded: ScanSummary = try DirectoryScanner.scan(
-        root: Data(root.path.utf8), options: scanOptions(excludedPaths: [Data(child.path.utf8)]), isCancelled: { false }
+        root: Data(root.path.utf8), options: scanOptions(excludedPaths: [Data(child.path.utf8)]), isCancelled: { false }, receiveProgress: { _ in }
     ) { entries.append(contentsOf: $0) }
     #expect(entries.count == 1)
     #expect(excluded.issues.contains { $0.kind == .excluded && $0.path == Data(child.path.utf8) })
@@ -124,7 +125,7 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     defer { try? FileManager.default.removeItem(at: root) }
     #expect(throws: ScanError.cancelled) {
         try DirectoryScanner.scan(
-            root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { true }
+            root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { true }, receiveProgress: { _ in }
         ) { _ in Issue.record("Cancelled scan emitted entries") }
     }
 }
@@ -217,7 +218,7 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     let deepRoot: Data = try #require(leaf.parentPath)
     var direct: [ScanEntry] = []
     let directSummary: ScanSummary = try DirectoryScanner.enumerateDirectory(
-        path: deepRoot, options: scanOptions(excludedPaths: []), isCancelled: { false }
+        path: deepRoot, options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }
     ) { direct.append(contentsOf: $0) }
     #expect(direct.count == 2)
     #expect(directSummary.issues.isEmpty)
@@ -230,7 +231,7 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     try FileManager.default.createDirectory(at: child, withIntermediateDirectories: false)
     var entries: [ScanEntry] = []
     let options: ScanOptions = ScanOptions(batchSize: 1, bufferSize: 4096, mountPolicy: .crossDevices, excludedPaths: [])
-    let summary: ScanSummary = try DirectoryScanner.scan(root: Data(root.path.utf8), options: options, isCancelled: { false }) { batch in
+    let summary: ScanSummary = try DirectoryScanner.scan(root: Data(root.path.utf8), options: options, isCancelled: { false }, receiveProgress: { _ in }) { batch in
         entries.append(contentsOf: batch)
         if batch.contains(where: { $0.path == Data(child.path.utf8) }) {
             try FileManager.default.removeItem(at: child)
@@ -247,13 +248,13 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     let invalid: [Data] = [Data(), Data("relative".utf8), Data("/tmp/..".utf8), Data("/tmp//file".utf8), Data([0x2f, 0])]
     for path: Data in invalid {
         #expect(throws: ScanError.invalidPath(path)) {
-            try DirectoryScanner.scan(root: path, options: scanOptions(excludedPaths: []), isCancelled: { false }) { _ in }
+            try DirectoryScanner.scan(root: path, options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }) { _ in }
         }
     }
     #expect(throws: ScanError.invalidOptions("batchSize must be positive and bufferSize must be 4096 through 16777216")) {
         try DirectoryScanner.scan(root: Data(root.path.utf8),
             options: ScanOptions(batchSize: 0, bufferSize: 4096, mountPolicy: .crossDevices, excludedPaths: []),
-            isCancelled: { false }) { _ in }
+            isCancelled: { false }, receiveProgress: { _ in }) { _ in }
     }
 }
 
@@ -277,7 +278,7 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     let alias: URL = root.appendingPathComponent("alias")
     try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
     #expect(throws: ScanError.self) {
-        try DirectoryScanner.scan(root: Data(alias.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }) { _ in }
+        try DirectoryScanner.scan(root: Data(alias.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }) { _ in }
     }
 }
 
@@ -294,7 +295,7 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
 
 @Test func bulkDeviceIdentityMatchesOpenedSystemDirectory() throws {
     var entries: [ScanEntry] = []
-    _ = try DirectoryScanner.enumerateDirectory(path: Data([0x2f]), options: scanOptions(excludedPaths: []), isCancelled: { false }) {
+    _ = try DirectoryScanner.enumerateDirectory(path: Data([0x2f]), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }) {
         entries.append(contentsOf: $0)
     }
     let entry: ScanEntry = try #require(entries.first { $0.path == Data("/usr".utf8) })
@@ -335,19 +336,96 @@ private func collectScan(root: URL) throws -> (entries: [ScanEntry], summary: Sc
     #expect(decoded == summary)
 }
 
+@Test func scanProgressAdvancesThroughNestedAndSiblingDirectoriesBeforeBatchFlush() throws {
+    let root: URL = try fixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("a/deep"), withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("b"), withIntermediateDirectories: false)
+    try Data([1]).write(to: root.appendingPathComponent("a/deep/file"))
+    var progress: [Double] = []
+    var emittedBatches: Int = 0
+    let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 4096, mountPolicy: .crossDevices, excludedPaths: [])
+    _ = try DirectoryScanner.scan(root: Data(root.path.utf8), options: options, isCancelled: { false }, receiveProgress: { fraction in
+        progress.append(fraction)
+        if fraction < 1 { #expect(emittedBatches == 0) }
+    }) { _ in emittedBatches += 1 }
+    #expect(progress.contains { $0 > 0 && $0 < 1 })
+    #expect(progress.last == 1)
+    #expect(progress.allSatisfy { $0 >= 0 && $0 <= 1 })
+    #expect(zip(progress, progress.dropFirst()).allSatisfy { $0 <= $1 })
+    #expect(emittedBatches == 1)
+}
+
+@Test func scanProgressCompletesEmptyAndFilesOnlyDirectories() throws {
+    let root: URL = try fixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    var progress: [Double] = []
+    _ = try DirectoryScanner.scan(root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { progress.append($0) }) { _ in }
+    #expect(progress.last == 1)
+    try Data([1]).write(to: root.appendingPathComponent("file"))
+    progress.removeAll()
+    _ = try DirectoryScanner.scan(root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { progress.append($0) }) { _ in }
+    #expect(progress.last == 1)
+}
+
+@Test func scanProgressCompletesVanishedDirectoryJobs() throws {
+    let root: URL = try fixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let child: URL = root.appendingPathComponent("vanished")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: false)
+    var progress: [Double] = []
+    let options: ScanOptions = ScanOptions(batchSize: 1, bufferSize: 4096, mountPolicy: .crossDevices, excludedPaths: [])
+    let summary: ScanSummary = try DirectoryScanner.scan(root: Data(root.path.utf8), options: options, isCancelled: { false }, receiveProgress: { progress.append($0) }) { batch in
+        if batch.contains(where: { $0.path == Data(child.path.utf8) }) { try FileManager.default.removeItem(at: child) }
+    }
+    #expect(progress.last == 1)
+    #expect(summary.issues.contains { $0.kind == .vanished })
+}
+
+@Test(.enabled(if: geteuid() != 0)) func scanProgressCompletesPermissionGapJobs() throws {
+    let root: URL = try fixtureDirectory()
+    let child: URL = root.appendingPathComponent("locked")
+    try FileManager.default.createDirectory(at: child, withIntermediateDirectories: false)
+    defer {
+        #expect(chmod(child.path, mode_t(0o700)) == 0)
+        try? FileManager.default.removeItem(at: root)
+    }
+    #expect(chmod(child.path, 0) == 0)
+    var progress: [Double] = []
+    let summary: ScanSummary = try DirectoryScanner.scan(root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { progress.append($0) }) { _ in }
+    #expect(progress.last == 1)
+    #expect(summary.issues.contains { $0.kind == .permissionDenied })
+}
+
+@Test func scanProgressStopsBeforeCompletionWhenCancelled() throws {
+    let root: URL = try fixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root.appendingPathComponent("child"), withIntermediateDirectories: false)
+    let cancelled: Mutex<Bool> = Mutex(false)
+    var progress: [Double] = []
+    #expect(throws: ScanError.cancelled) {
+        try DirectoryScanner.scan(root: Data(root.path.utf8), options: scanOptions(excludedPaths: []), isCancelled: { cancelled.withLock { $0 } }, receiveProgress: { fraction in
+            progress.append(fraction)
+            cancelled.withLock { $0 = true }
+        }) { _ in }
+    }
+    #expect(progress.contains { $0 > 0 && $0 < 1 })
+    #expect(!progress.contains(1))
+}
+
 @Test func boundedSystemFirmlinkScanReturnsCanonicalAliasWithoutWalkingUserContents() throws {
     let directories: [Data] = ["/", "/Users", "/System", "/System/Volumes", "/System/Volumes/Data"].map { Data($0.utf8) }
     let retained: Set<Data> = Set(directories + [Data("/System/Volumes/Data/Users".utf8)])
     var excluded: Set<Data> = []
     for directory: Data in directories {
-        _ = try DirectoryScanner.enumerateDirectory(path: directory, options: scanOptions(excludedPaths: []), isCancelled: { false }) { batch in
+        _ = try DirectoryScanner.enumerateDirectory(path: directory, options: scanOptions(excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }) { batch in
             for entry: ScanEntry in batch where entry.path != directory && !retained.contains(entry.path) {
                 excluded.insert(entry.path)
             }
         }
     }
     let options: ScanOptions = ScanOptions(batchSize: 2, bufferSize: 4096, mountPolicy: .crossDevices, excludedPaths: Array(excluded))
-    let summary: ScanSummary = try DirectoryScanner.scan(root: Data([0x2f]), options: options, isCancelled: { false }) { _ in }
+    let summary: ScanSummary = try DirectoryScanner.scan(root: Data([0x2f]), options: options, isCancelled: { false }, receiveProgress: { _ in }) { _ in }
     #expect(summary.metrics.directories == 5)
     #expect(summary.aliases == [ScanAlias(aliasPath: Data("/System/Volumes/Data/Users".utf8), targetPath: Data("/Users".utf8))])
     #expect(summary.aliases.allSatisfy { alias in

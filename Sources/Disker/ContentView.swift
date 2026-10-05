@@ -127,40 +127,49 @@ struct ContentView: View {
             searchText = ""
         }
         .onChange(of: searchText) { _, _ in selection = nil }
+        .onChange(of: model.sortOrder) { _, _ in
+            Task { await model.sort() }
+        }
     }
 
     private var tree: some View {
-        Table(of: DiskTreeRow.self, selection: $selection) {
-            TableColumn("Name") { row in
+        Table(of: DiskTreeRow.self, selection: $selection, sortOrder: $model.sortOrder) {
+            TableColumn("Name", sortUsing: DiskTreeSort(sort: NodeSort(column: .name, order: .forward))) { row in
                 TreeNameCell(row: row, model: model)
             }
-            .width(min: CGFloat((model.rows.map(\.depth).max() ?? 0) * 16 + 300), ideal: 440, max: .infinity)
-            TableColumn("Size proportion") { row in
+            .width(min: nameColumnMinimum, ideal: max(440, nameColumnMinimum), max: .infinity)
+            TableColumn("Size proportion", sortUsing: DiskTreeSort(sort: NodeSort(column: .sizeProportion, order: .reverse))) { row in
                 if let proportion: Double = row.proportion {
                     SizeProportionBar(proportion: proportion)
                 }
             }
             .width(min: 150, ideal: 180, max: 300)
-            TableColumn("Parent %") { row in
-                if let proportion: Double = row.proportion {
-                    Text(proportion.formatted(.percent.precision(.fractionLength(1))))
-                        .monospacedDigit()
-                }
-            }
-            .width(min: 85, ideal: 95, max: 120)
-            .alignment(.trailing)
-            TableColumn("Allocated size") { row in
+            TableColumn("Allocated size", sortUsing: DiskTreeSort(sort: NodeSort(column: .allocatedSize, order: .reverse))) { row in
                 if let node: IndexedNode = row.node { Text(fileSize(node.subtreeAllocatedBytes)).monospacedDigit() }
             }
             .width(min: 120, ideal: 130, max: 180)
             .alignment(.trailing)
-            TableColumn("Logical size") { row in
-                if let node: IndexedNode = row.node { Text(fileSize(node.subtreeLogicalBytes)).monospacedDigit() }
-            }
-            .width(min: 120, ideal: 130, max: 180)
-            .alignment(.trailing)
-            TableColumn("Items") { row in
+            TableColumn("Date Last Opened", sortUsing: DiskTreeSort(sort: NodeSort(column: .lastOpened, order: .reverse))) { row in
                 if let node: IndexedNode = row.node {
+                    if model.sortOrder.first?.sort.column == .lastOpened, row.depth > 0 {
+                        Text(lastOpenedLabel(node.lastOpenedDate))
+                            .lineLimit(1)
+                            .help(node.lastOpenedDate == nil ? "Date last opened unavailable" : lastOpenedLabel(node.lastOpenedDate))
+                    } else {
+                        LastOpenedDateCell(path: node.entry.path, operations: operations)
+                            .id(model.summary?.revision)
+                    }
+                }
+            }
+            .width(min: 190, ideal: 230, max: 320)
+            TableColumn("Items", sortUsing: DiskTreeSort(sort: NodeSort(column: .items, order: .reverse))) { row in
+                if let node: IndexedNode = row.node {
+                    Text(node.itemCount.formatted())
+                        .monospacedDigit()
+                }
+            }
+            .width(min: 75, ideal: 90, max: 140)
+            .alignment(.trailing)
         } rows: {
             ForEach(visibleRows) { row in
                 TableRow(row)
@@ -170,12 +179,6 @@ struct ContentView: View {
                         catch { fileOperationError = error.localizedDescription; return nil }
                     }
             }
-                    Text((node.entry.metadata.kind == .directory ? max(0, node.subtreeNodeCount - 1) : 1).formatted())
-                        .monospacedDigit()
-                }
-            }
-            .width(min: 75, ideal: 90, max: 140)
-            .alignment(.trailing)
         }
         .tableStyle(.inset(alternatesRowBackgrounds: true))
         .contextMenu(forSelectionType: DiskTreeRowID.self) { ids in
@@ -232,6 +235,8 @@ struct ContentView: View {
     private var blockingIssues: [ScanIssue] {
         model.summary?.issues.filter { ![.excluded, .directoryAlias, .mountBoundary].contains($0.kind) } ?? []
     }
+
+    private var nameColumnMinimum: CGFloat { CGFloat((model.rows.map(\.depth).max() ?? 0) * 16 + 300) }
 
     private var rootURL: URL { URL(fileURLWithPath: model.rootPath) }
 
@@ -434,6 +439,38 @@ struct ContentView: View {
     }
 }
 
+private struct LastOpenedDateCell: View {
+    let path: Data
+    let operations: FileOperations
+    @State private var date: Date?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Text(lastOpenedLabel(date))
+            .lineLimit(1)
+            .help(errorMessage ?? (date == nil ? "Date last opened unavailable" : lastOpenedLabel(date)))
+            .task(id: path) {
+                do {
+                    let opened: Date? = try await operations.lastOpenedDate(path)
+                    guard !Task.isCancelled else { return }
+                    date = opened
+                    errorMessage = nil
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    date = nil
+                    errorMessage = error.localizedDescription
+                }
+            }
+    }
+}
+
+private func lastOpenedLabel(_ date: Date?) -> String {
+    guard let date else { return "-" }
+    return date.formatted(.dateTime.month(.abbreviated).day().year().hour().minute())
+        .replacingOccurrences(of: "\u{a0}", with: " ")
+        .replacingOccurrences(of: "\u{202f}", with: " ")
+}
+
 private struct RenameItemSheet: View {
     let item: FileItem
     let rename: (String) -> Void
@@ -491,11 +528,16 @@ private struct TreeScanStatus: View {
             HStack {
                 if model.isScanning {
                     ProgressView().controlSize(.small)
+                    ProgressView(value: model.scanProgress, total: 1)
+                        .progressViewStyle(.linear)
+                        .frame(width: 140)
+                        .accessibilityLabel("Estimated scan progress")
+                        .accessibilityValue(model.scanProgress.formatted(.percent.precision(.fractionLength(0))))
+                        .help("Estimated from completed folders")
                     if model.isWaitingForWriter {
                         Text("Waiting for another scan")
                     } else {
                         Text("Scanning - \(model.scannedEntries.formatted()) items observed")
-                        Text("Sizes are preliminary").foregroundStyle(.secondary)
                     }
                 } else if model.scanStopped { Text("Scan stopped") }
                 else if let summary: IndexSummary = model.summary {

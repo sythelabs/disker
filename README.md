@@ -1,6 +1,6 @@
 # Disker
 
-Native SwiftUI desktop app for macOS 26 and later, using Swift 6.2. The disk index backend is implemented; the app retains its starter window.
+Native SwiftUI disk usage app for macOS 26 and later, using Swift 6.2.
 
 ## Run
 
@@ -10,7 +10,18 @@ just run
 
 Requires `just` and full Xcode 26 or later, including Swift Testing. The standalone Command Line Tools on this host do not include the `Testing` module. Recipes select `/Applications/Xcode.app/Contents/Developer`; set `DEVELOPER_DIR` to use another installation.
 
-Build the local, ad-hoc signed app bundle with `just build`. The app is created at `.build/Disker.app`. Open `Package.swift` in Xcode to edit the project.
+Build the local, ad-hoc signed app bundle with `just build`. The app is created at `.build/Disker.app`. `just run` launches a fresh instance so a previous process cannot hide rebuilt changes. Open `Package.swift` in Xcode to edit the project.
+
+Run `just full-disk-access` to build Disker, reveal its app bundle in Finder, and open the Full Disk Access settings. Drag the selected app into the settings list, enable it, then quit Disker and run `just run`. macOS requires manual approval; this command cannot grant access itself. Ad-hoc signed builds may need renewed approval after code changes.
+
+## File tree
+
+- Starts in the current user's home folder. Choose Folder retargets the tree, including `/` when permissions allow.
+- Expand folders to inspect files and nested directories, ordered by allocated size. Cached branches load in pages of 500 items; Load more items continues the listing.
+- Size proportion bars and Parent % show each item's allocated size relative to its parent. Allocated size, logical size, and descendant item counts remain aligned while scrolling.
+- The native table supports horizontal and vertical scrolling and resizable columns. Double-click or use Left and Right to collapse and expand folders.
+- Cached rows appear before refresh. On a first scan, top-level rows and preliminary totals stream into the table; nested branches become available after the scan commits. Progress shows observed items, with Stop Scan and Refresh controls.
+- Unreadable locations and scan errors are explicit. Raw filename bytes preserve row identity even when displayed names are identical.
 
 ## Backend commands
 
@@ -43,7 +54,7 @@ just benchmark 100000
 
 ## Verification and measurements
 
-- 61 Swift Testing tests pass, covering real filesystem/Git fixtures, persisted restart replay, scoped mutations, permissions, streaming, rollback, worktrees, aliases, deep trees, sparse files, hard links, and invalid UTF-8 names.
+- 70 Swift Testing tests cover filesystem/Git fixtures, persisted restart replay, scoped mutations, permissions, streaming, rollback, worktrees, aliases, deep trees, sparse files, hard links, invalid UTF-8 names, file-tree expansion, paging, proportions, retargeting, cancellation, and fresh development launches.
 - `just build`, strict code-signature verification, plist validation, native C warning checks, and CLI paths containing spaces pass.
 - Final release measurements use an Apple M5 with 32 GiB RAM on macOS 26.5.2. Fixtures have warm OS filesystem caches; these are not cold-disk or app UI launch measurements.
 

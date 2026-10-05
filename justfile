@@ -12,7 +12,12 @@ build:
     codesign --force --sign - .build/Disker.app
 
 run: build
-    open .build/Disker.app
+    open -n .build/Disker.app
+
+full-disk-access: build
+    open -R .build/Disker.app
+    open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"
+    @printf '%s\n' 'Drag Disker.app from Finder into Full Disk Access and enable it. Quit Disker, then run just run.'
 
 test:
     swift test

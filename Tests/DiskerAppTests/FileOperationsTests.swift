@@ -25,7 +25,7 @@ private func removeOperationFixture(_ fixture: FileOperationFixture) {
 
 private func operationItem(path: Data, root: URL) throws -> FileItem {
     var entries: [ScanEntry] = []
-    _ = try DirectoryScanner.scan(root: Data(root.path.utf8), options: ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: []), isCancelled: { false }, receiveBatch: { entries.append(contentsOf: $0) })
+    _ = try DirectoryScanner.scan(root: Data(root.path.utf8), options: ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: []), isCancelled: { false }, receiveProgress: { _ in }, receiveBatch: { entries.append(contentsOf: $0) })
     return try FileItem(entry: #require(entries.first { $0.path == path }))
 }
 

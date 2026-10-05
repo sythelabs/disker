@@ -131,6 +131,7 @@ private struct ProgressRecord: Encodable {
     let elapsedSeconds: Double?
     let previousNodeCount: Int64?
     let isComplete: Bool?
+    let completionFraction: Double?
 }
 
 private final class ProgressWriter: @unchecked Sendable {
@@ -148,19 +149,19 @@ private final class ProgressWriter: @unchecked Sendable {
         let record: ProgressRecord
         switch event {
         case .waitingForWriter:
-            record = ProgressRecord(event: "waiting_for_writer", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: nil, isComplete: nil)
+            record = ProgressRecord(event: "waiting_for_writer", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: nil, isComplete: nil, completionFraction: nil)
         case .writerAcquired:
-            record = ProgressRecord(event: "writer_acquired", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: nil, isComplete: nil)
+            record = ProgressRecord(event: "writer_acquired", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: nil, isComplete: nil, completionFraction: nil)
         case let .started(cached):
-            record = ProgressRecord(event: "started", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: cached?.nodeCount, isComplete: cached?.isComplete)
+            record = ProgressRecord(event: "started", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: cached?.nodeCount, isComplete: cached?.isComplete, completionFraction: 0)
         case .batch:
             return
         case let .progress(progress):
             guard progress.elapsedSeconds - lastElapsed >= 0.5 else { return }
             lastElapsed = progress.elapsedSeconds
-            record = ProgressRecord(event: "progress", root: root, entriesObserved: progress.entriesObserved, logicalBytesObserved: progress.logicalBytesObserved, elapsedSeconds: progress.elapsedSeconds, previousNodeCount: progress.previousNodeCount, isComplete: nil)
+            record = ProgressRecord(event: "progress", root: root, entriesObserved: progress.entriesObserved, logicalBytesObserved: progress.logicalBytesObserved, elapsedSeconds: progress.elapsedSeconds, previousNodeCount: progress.previousNodeCount, isComplete: nil, completionFraction: progress.completionFraction)
         case let .completed(summary):
-            record = ProgressRecord(event: "completed", root: root, entriesObserved: summary.nodeCount, logicalBytesObserved: summary.logicalBytes, elapsedSeconds: nil, previousNodeCount: nil, isComplete: summary.isComplete)
+            record = ProgressRecord(event: "completed", root: root, entriesObserved: summary.nodeCount, logicalBytesObserved: summary.logicalBytes, elapsedSeconds: nil, previousNodeCount: nil, isComplete: summary.isComplete, completionFraction: 1)
         }
         do {
             var data: Data = try JSONEncoder().encode(record)

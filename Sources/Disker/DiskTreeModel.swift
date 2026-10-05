@@ -53,6 +53,24 @@ func searchTreeRows(_ rows: [DiskTreeRow], query: String) -> [DiskTreeRow] {
     return Array(matches.reversed())
 }
 
+struct DiskTreeSort: SortComparator {
+    var sort: NodeSort
+
+    var order: SortOrder {
+        get { sort.order }
+        set { sort.order = newValue }
+    }
+
+    func compare(_ lhs: DiskTreeRow, _ rhs: DiskTreeRow) -> ComparisonResult {
+        switch (lhs.node, rhs.node) {
+        case (.some(let left), .some(let right)): return sort.compare(left, right)
+        case (.some, .none): return .orderedAscending
+        case (.none, .some): return .orderedDescending
+        case (.none, .none): return .orderedSame
+        }
+    }
+}
+
 private struct ChildPage {
     let nodes: [IndexedNode]
     let hasMore: Bool
@@ -66,17 +84,22 @@ final class DiskTreeModel {
     private(set) var isScanning: Bool = false
     private(set) var isWaitingForWriter: Bool = false
     private(set) var scannedEntries: Int64 = 0
+    private(set) var scanProgress: Double = 0
     private(set) var errorMessage: String?
     private(set) var scanStopped: Bool = false
     private(set) var expanded: Set<Data>
     private(set) var loading: Set<Data> = []
+    var sortOrder: [DiskTreeSort] = [DiskTreeSort(sort: NodeSort(column: .allocatedSize, order: .reverse))]
     private var rootNode: IndexedNode?
     private var pages: [Data: ChildPage] = [:]
+    private var loadedSort: NodeSort?
     private var backPaths: [String] = []
     private var forwardPaths: [String] = []
     private let cacheURL: URL
     @ObservationIgnored private var index: DiskIndex?
     @ObservationIgnored private var generation: UInt64 = 0
+    @ObservationIgnored private var sortGeneration: UInt64 = 0
+    @ObservationIgnored private var previewSort: NodeSort?
     @ObservationIgnored private var scanTask: Task<Void, Never>?
     @ObservationIgnored private var scanBuffer: TreeScanBuffer?
     private let pageSize: Int = 500
@@ -157,6 +180,7 @@ final class DiskTreeModel {
         loading = []
         rootNode = nil
         summary = nil
+        scanProgress = 0
         errorMessage = nil
         scanStopped = false
         guard index != nil else { await start(); return }
@@ -193,11 +217,25 @@ final class DiskTreeModel {
         isWaitingForWriter = false
         scanStopped = false
         scannedEntries = 0
+        scanProgress = 0
         errorMessage = nil
         scanTask = Task {
             let polling: Task<Void, Never> = Task { [weak self] in
                 while !Task.isCancelled {
-                    self?.applyPreview(buffer.snapshot(), ticket: ticket)
+                    guard let self else { return }
+                    let sorting: UInt64 = self.sortGeneration
+                    let sort: NodeSort? = self.previewSort
+                    do {
+                        let preview: TreeScanPreview = try await Task.detached(priority: .utility) {
+                            let preview: TreeScanPreview = buffer.snapshot()
+                            if let sort { return try preview.sorted(using: sort) }
+                            return preview
+                        }.value
+                        self.applyPreview(preview, ticket: ticket, sorting: sorting)
+                    } catch {
+                        if ticket == self.generation, sorting == self.sortGeneration { self.errorMessage = String(describing: error) }
+                        return
+                    }
                     do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
                 }
             }
@@ -206,6 +244,8 @@ final class DiskTreeModel {
                 _ = try await index.refresh(root: root, mode: mode, receiveEvent: { buffer.receive($0) }, isCancelled: { buffer.isCancelled })
                 guard ticket == generation else { return }
                 try await reloadSnapshot(ticket: ticket)
+                guard ticket == generation else { return }
+                scanProgress = 1
             } catch ScanError.cancelled {
                 guard ticket == generation else { return }
                 scanStopped = true
@@ -238,12 +278,33 @@ final class DiskTreeModel {
         await loadPage(directory: path, offset: pages[path]?.nodes.count ?? 0, ticket: generation)
     }
 
+    func sort() async {
+        sortGeneration += 1
+        previewSort = sortOrder.first?.sort
+        loading = []
+        let ticket: UInt64 = generation
+        let sorting: UInt64 = sortGeneration
+        do {
+            if summary == nil {
+                if let buffer: TreeScanBuffer = scanBuffer, let sort: NodeSort = previewSort {
+                    let preview: TreeScanPreview = try await Task.detached(priority: .utility) {
+                        try buffer.snapshot().sorted(using: sort)
+                    }.value
+                    applyPreview(preview, ticket: ticket, sorting: sorting)
+                }
+            } else { try await reloadSnapshot(ticket: ticket) }
+        } catch {
+            if ticket == generation, sorting == sortGeneration { errorMessage = String(describing: error) }
+        }
+    }
+
     private func reloadSnapshot(ticket: UInt64) async throws {
-        guard let index else { return }
+        guard let index, let sort: NodeSort = sortOrder.first?.sort else { return }
+        let sorting: UInt64 = sortGeneration
         let root: String = rootPath
         let saved: IndexSummary? = try await index.cachedSummary(root: root)
         let node: IndexedNode? = try await index.node(root: root, path: Data(root.utf8))
-        guard ticket == generation else { return }
+        guard ticket == generation, sorting == sortGeneration, !Task.isCancelled else { return }
         var reloaded: [Data: ChildPage] = [:]
         var requestedCounts: [Data: Int] = [:]
         if saved != nil {
@@ -254,8 +315,8 @@ final class DiskTreeModel {
                 var nodes: [IndexedNode] = []
                 var page: ChildPage
                 repeat {
-                    page = try await queryPage(index: index, root: root, directory: directory, offset: nodes.count)
-                    guard ticket == generation else { return }
+                    page = try await queryPage(index: index, root: root, directory: directory, offset: nodes.count, sort: sort)
+                    guard ticket == generation, sorting == sortGeneration, !Task.isCancelled else { return }
                     nodes.append(contentsOf: page.nodes)
                 } while page.hasMore && nodes.count < count
                 reloaded[directory] = ChildPage(nodes: nodes, hasMore: page.hasMore, parentBytes: page.parentBytes)
@@ -265,33 +326,35 @@ final class DiskTreeModel {
         summary = saved
         rootNode = node
         pages = reloaded
+        loadedSort = sort
     }
 
     private func loadPage(directory: Data, offset: Int, ticket: UInt64) async {
-        guard let index, summary != nil, !loading.contains(directory), ticket == generation else { return }
+        guard let index, let sort: NodeSort = sortOrder.first?.sort, sort == loadedSort, summary != nil, !loading.contains(directory), ticket == generation else { return }
+        let sorting: UInt64 = sortGeneration
         loading.insert(directory)
         let root: String = rootPath
         let revision: Int64? = summary?.revision
         do {
-            let page: ChildPage = try await queryPage(index: index, root: root, directory: directory, offset: offset)
+            let page: ChildPage = try await queryPage(index: index, root: root, directory: directory, offset: offset, sort: sort)
             let current: IndexSummary? = try await index.cachedSummary(root: root)
-            guard ticket == generation, summary?.revision == revision, current?.revision == revision else {
-                if ticket == generation { loading.remove(directory) }
+            guard ticket == generation, sorting == sortGeneration, summary?.revision == revision, current?.revision == revision else {
+                if ticket == generation, sorting == sortGeneration { loading.remove(directory) }
                 return
             }
             let previous: [IndexedNode] = offset == 0 ? [] : (pages[directory]?.nodes ?? [])
             pages[directory] = ChildPage(nodes: previous + page.nodes, hasMore: page.hasMore, parentBytes: page.parentBytes)
             loading.remove(directory)
         } catch {
-            if ticket == generation {
+            if ticket == generation, sorting == sortGeneration {
                 loading.remove(directory)
                 errorMessage = String(describing: error)
             }
         }
     }
 
-    private func queryPage(index: DiskIndex, root: String, directory: Data, offset: Int) async throws -> ChildPage {
-        let children: [IndexedNode] = try await index.children(root: root, directory: directory, offset: offset, limit: pageSize + 1)
+    private func queryPage(index: DiskIndex, root: String, directory: Data, offset: Int, sort: NodeSort) async throws -> ChildPage {
+        let children: [IndexedNode] = try await index.children(root: root, directory: directory, offset: offset, limit: pageSize + 1, sort: sort)
         let parent: IndexedNode? = try await index.node(root: root, path: directory)
         let parentBytes: UInt64
         if let target: Data = parent?.aliasTargetPath {
@@ -302,20 +365,19 @@ final class DiskTreeModel {
             var path: Data = directory
             if path.last != 47 { path.append(47) }
             path.append(child.entry.name)
-            return IndexedNode(entry: ScanEntry(path: path, parentPath: directory, name: child.entry.name, metadata: child.entry.metadata), subtreeLogicalBytes: child.subtreeLogicalBytes, subtreeAllocatedBytes: child.subtreeAllocatedBytes, subtreeNodeCount: child.subtreeNodeCount, aliasTargetPath: child.aliasTargetPath)
+            return IndexedNode(entry: ScanEntry(path: path, parentPath: directory, name: child.entry.name, metadata: child.entry.metadata), subtreeLogicalBytes: child.subtreeLogicalBytes, subtreeAllocatedBytes: child.subtreeAllocatedBytes, subtreeNodeCount: child.subtreeNodeCount, aliasTargetPath: child.aliasTargetPath, lastOpenedDate: child.lastOpenedDate)
         }
         return ChildPage(nodes: projected, hasMore: children.count > pageSize, parentBytes: parentBytes)
     }
 
-    private func applyPreview(_ preview: TreeScanPreview, ticket: UInt64) {
-        guard ticket == generation, isScanning else { return }
+    private func applyPreview(_ preview: TreeScanPreview, ticket: UInt64, sorting: UInt64) {
+        guard ticket == generation, sorting == sortGeneration, isScanning else { return }
         isWaitingForWriter = preview.isWaitingForWriter && scanBuffer?.isCancelled == false
         scannedEntries = preview.progress?.entriesObserved ?? scannedEntries
+        scanProgress = preview.progress?.completionFraction ?? scanProgress
         guard summary == nil, let root: ScanEntry = preview.root else { return }
-        let logical: UInt64 = preview.progress?.logicalBytesObserved ?? 0
-        let allocated: UInt64 = preview.progress?.allocatedBytesObserved ?? 0
-        rootNode = IndexedNode(entry: root, subtreeLogicalBytes: logical, subtreeAllocatedBytes: allocated, subtreeNodeCount: max(1, scannedEntries), aliasTargetPath: nil)
-        pages[root.path] = ChildPage(nodes: preview.nodes, hasMore: false, parentBytes: allocated)
+        rootNode = IndexedNode(entry: root, subtreeLogicalBytes: preview.totals.logical, subtreeAllocatedBytes: preview.totals.allocated, subtreeNodeCount: preview.totals.count, aliasTargetPath: nil)
+        pages[root.path] = ChildPage(nodes: preview.nodes, hasMore: false, parentBytes: preview.totals.allocated)
     }
 }
 
@@ -324,12 +386,29 @@ struct TreeScanPreview: Sendable {
     let nodes: [IndexedNode]
     let progress: IndexProgress?
     let isWaitingForWriter: Bool
+    let totals: PreviewTotals
+
+    func sorted(using sort: NodeSort) throws -> TreeScanPreview {
+        let enriched: [IndexedNode]
+        if sort.column == .lastOpened {
+            enriched = try nodes.map { node in
+                IndexedNode(entry: node.entry, subtreeLogicalBytes: node.subtreeLogicalBytes, subtreeAllocatedBytes: node.subtreeAllocatedBytes, subtreeNodeCount: node.subtreeNodeCount, aliasTargetPath: node.aliasTargetPath, lastOpenedDate: try fileLastOpenedDate(path: node.entry.path))
+            }
+        } else { enriched = nodes }
+        return TreeScanPreview(root: root, nodes: enriched.sorted(using: sort), progress: progress, isWaitingForWriter: isWaitingForWriter, totals: totals)
+    }
 }
 
-private struct PreviewTotals: Sendable {
+struct PreviewTotals: Sendable {
     var logical: UInt64
     var allocated: UInt64
     var count: Int64
+}
+
+private struct DirectoryPreview: Sendable {
+    let ownAllocated: UInt64
+    var files: PreviewTotals
+    var children: Set<Data>
 }
 
 private struct TreeScanState: Sendable {
@@ -338,7 +417,8 @@ private struct TreeScanState: Sendable {
     var root: ScanEntry?
     var entries: [Data: ScanEntry]
     var entryOrder: [Data]
-    var totals: [Data: PreviewTotals]
+    var directories: [Data: DirectoryPreview]
+    var lastDirectory: Data?
     var progress: IndexProgress?
 }
 
@@ -354,7 +434,7 @@ final class TreeScanBuffer: Sendable {
         prefix = root.last == 47 ? root : root + Data([47])
         self.capturePreview = capturePreview
         self.limit = limit
-        state = Mutex(TreeScanState(cancelled: false, isWaitingForWriter: false, root: nil, entries: [:], entryOrder: [], totals: [:], progress: nil))
+        state = Mutex(TreeScanState(cancelled: false, isWaitingForWriter: false, root: nil, entries: [:], entryOrder: [], directories: [:], lastDirectory: nil, progress: nil))
     }
 
     var isCancelled: Bool { state.withLock { $0.cancelled } }
@@ -375,23 +455,38 @@ final class TreeScanBuffer: Sendable {
             case .batch(let entries):
                 guard capturePreview else { return }
                 for entry: ScanEntry in entries {
-                    if entry.path == root { state.root = entry; continue }
+                    if entry.parentPath == nil {
+                        if entry.path == root {
+                            state.root = entry
+                            state.entries.removeAll(keepingCapacity: true)
+                        }
+                        state.lastDirectory = nil
+                        state.directories[entry.path] = DirectoryPreview(ownAllocated: entry.metadata.allocatedBytes, files: PreviewTotals(logical: 0, allocated: 0, count: 0), children: [])
+                        continue
+                    }
                     guard entry.path.starts(with: prefix) else { continue }
-                    let suffix: Data = entry.path.dropFirst(prefix.count)
-                    let component: Data = suffix.prefix { $0 != 47 }
-                    let top: Data = prefix + component
-                    if entry.parentPath == root, state.entries[top] != nil || state.entries.count < limit {
-                        state.entries[top] = entry
-                        if !state.entryOrder.contains(top) { state.entryOrder.append(top) }
-                        if state.totals[top] == nil { state.totals[top] = PreviewTotals(logical: 0, allocated: 0, count: 0) }
+                    guard let parent: Data = entry.parentPath else { continue }
+                    if state.lastDirectory != parent {
+                        let own: UInt64 = state.directories[parent]?.ownAllocated ?? 0
+                        state.directories[parent] = DirectoryPreview(ownAllocated: own, files: PreviewTotals(logical: 0, allocated: 0, count: 0), children: [])
+                        state.lastDirectory = parent
+                        if parent == root { state.entries.removeAll(keepingCapacity: true) }
                     }
-                    guard var totals: PreviewTotals = state.totals[top] else { continue }
-                    if entry.metadata.kind != .directory {
-                        totals.logical += entry.metadata.logicalBytes
-                        totals.allocated += entry.metadata.allocatedBytes
+                    if parent == root, state.entries[entry.path] != nil || state.entries.count < limit {
+                        state.entries[entry.path] = entry
+                        if !state.entryOrder.contains(entry.path) { state.entryOrder.append(entry.path) }
                     }
-                    totals.count += 1
-                    state.totals[top] = totals
+                    var directory: DirectoryPreview = state.directories[parent]!
+                    if entry.metadata.kind == .directory {
+                        directory.children.insert(entry.path)
+                        let previous: DirectoryPreview? = state.directories[entry.path]
+                        state.directories[entry.path] = DirectoryPreview(ownAllocated: entry.metadata.allocatedBytes, files: previous?.files ?? PreviewTotals(logical: 0, allocated: 0, count: 0), children: previous?.children ?? [])
+                    } else {
+                        directory.files.logical += entry.metadata.logicalBytes
+                        directory.files.allocated += entry.metadata.allocatedBytes
+                        directory.files.count += 1
+                    }
+                    state.directories[parent] = directory
                 }
             case .started, .completed: state.isWaitingForWriter = false
             }
@@ -400,12 +495,30 @@ final class TreeScanBuffer: Sendable {
 
     func snapshot() -> TreeScanPreview {
         state.withLock { state in
+            var totals: [Data: PreviewTotals] = [:]
+            var pending: [(path: Data, visited: Bool)] = [(root, false)]
+            while let item: (path: Data, visited: Bool) = pending.popLast() {
+                guard let directory: DirectoryPreview = state.directories[item.path] else { continue }
+                if !item.visited {
+                    pending.append((item.path, true))
+                    for child: Data in directory.children { pending.append((child, false)) }
+                    continue
+                }
+                var total: PreviewTotals = PreviewTotals(logical: directory.files.logical, allocated: directory.ownAllocated + directory.files.allocated, count: 1 + directory.files.count)
+                for child: Data in directory.children {
+                    guard let subtotal: PreviewTotals = totals[child] else { continue }
+                    total.logical += subtotal.logical
+                    total.allocated += subtotal.allocated
+                    total.count += subtotal.count
+                }
+                totals[item.path] = total
+            }
             let nodes: [IndexedNode] = state.entryOrder.compactMap { path in
                 guard let entry: ScanEntry = state.entries[path] else { return nil }
-                let totals: PreviewTotals = state.totals[entry.path]!
-                return IndexedNode(entry: entry, subtreeLogicalBytes: totals.logical, subtreeAllocatedBytes: totals.allocated, subtreeNodeCount: totals.count, aliasTargetPath: nil)
+                let total: PreviewTotals = totals[entry.path] ?? PreviewTotals(logical: entry.metadata.logicalBytes, allocated: entry.metadata.allocatedBytes, count: 1)
+                return IndexedNode(entry: entry, subtreeLogicalBytes: total.logical, subtreeAllocatedBytes: total.allocated, subtreeNodeCount: total.count, aliasTargetPath: nil)
             }
-            return TreeScanPreview(root: state.root, nodes: nodes, progress: state.progress, isWaitingForWriter: state.isWaitingForWriter)
+            return TreeScanPreview(root: state.root, nodes: nodes, progress: state.progress, isWaitingForWriter: state.isWaitingForWriter, totals: totals[root] ?? PreviewTotals(logical: 0, allocated: 0, count: 0))
         }
     }
 }

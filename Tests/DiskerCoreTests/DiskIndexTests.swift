@@ -1,10 +1,171 @@
 import Darwin
 import Foundation
+import Synchronization
 import Testing
 @testable import DiskerCore
 
 @Suite(.serialized)
 struct DiskIndexTests {
+    @Test(arguments: [SortOrder.forward, .reverse])
+    func selectedColumnsSortTheWholeDirectoryBeforePaging(order: SortOrder) async throws {
+        let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-columns-" + UUID().uuidString)
+        let root: URL = fixture.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("folder1"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("folder2"), withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: fixture) }
+            catch { Issue.record(error) }
+        }
+        try Data(repeating: 1, count: 65_536).write(to: root.appendingPathComponent("folder10"))
+        try Data([1]).write(to: root.appendingPathComponent("folder2/child2"))
+        try Data([1]).write(to: root.appendingPathComponent("folder2/child10"))
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.appendingPathComponent("cache/index.sqlite"))
+        _ = try await index.refresh(root: root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let expected: [(NodeSortColumn, [String])] = [
+            (.name, order == .forward ? ["folder1", "folder2", "folder10"] : ["folder10", "folder2", "folder1"]),
+            (.allocatedSize, order == .forward ? ["folder1", "folder2", "folder10"] : ["folder10", "folder2", "folder1"]),
+            (.sizeProportion, order == .forward ? ["folder1", "folder2", "folder10"] : ["folder10", "folder2", "folder1"]),
+            (.items, order == .forward ? ["folder1", "folder10", "folder2"] : ["folder2", "folder10", "folder1"])
+        ]
+        for (column, names): (NodeSortColumn, [String]) in expected {
+            let sort: NodeSort = NodeSort(column: column, order: order)
+            let first: [IndexedNode] = try await index.children(root: root.path, directory: Data(root.path.utf8), offset: 0, limit: 1, sort: sort)
+            let rest: [IndexedNode] = try await index.children(root: root.path, directory: Data(root.path.utf8), offset: 1, limit: 10, sort: sort)
+            #expect((first + rest).map { String(decoding: $0.entry.name, as: UTF8.self) } == names)
+        }
+        let dated: [IndexedNode] = try await index.children(root: root.path, directory: Data(root.path.utf8), offset: 0, limit: 10, sort: NodeSort(column: .lastOpened, order: order))
+        #expect(dated.count == 3)
+        if let missing: Int = dated.firstIndex(where: { $0.lastOpenedDate == nil }) {
+            #expect(dated.dropFirst(missing).allSatisfy { $0.lastOpenedDate == nil })
+        }
+        let dates: [Date] = dated.compactMap(\.lastOpenedDate)
+        #expect(zip(dates, dates.dropFirst()).allSatisfy { order == .forward ? $0 <= $1 : $0 >= $1 })
+    }
+
+    @Test(arguments: [SortOrder.forward, .reverse])
+    func lastOpenedSortUsesDatesAndKeepsUnavailableDatesLast(order: SortOrder) {
+        let timestamp: FileTimestamp = FileTimestamp(seconds: 0, nanoseconds: 0)
+        let metadata: FileMetadata = FileMetadata(kind: .regularFile, device: 1, inode: 1, linkCount: 1, mode: 0, ownerID: 0, groupID: 0, logicalBytes: 1, allocatedBytes: 1, birthTime: timestamp, modificationTime: timestamp, changeTime: timestamp, accessTime: timestamp, flags: 0)
+        let values: [(String, Date?)] = [("unknown10", nil), ("recent", Date(timeIntervalSince1970: 200)), ("unknown2", nil), ("older", Date(timeIntervalSince1970: 100))]
+        let nodes: [IndexedNode] = values.map { name, opened in
+            IndexedNode(entry: ScanEntry(path: Data(("/root/" + name).utf8), parentPath: Data("/root".utf8), name: Data(name.utf8), metadata: metadata), subtreeLogicalBytes: 1, subtreeAllocatedBytes: 1, subtreeNodeCount: 1, aliasTargetPath: nil, lastOpenedDate: opened)
+        }
+        let names: [String] = nodes.sorted(using: NodeSort(column: .lastOpened, order: order)).map { String(decoding: $0.entry.name, as: UTF8.self) }
+        #expect(names == (order == .forward ? ["older", "recent", "unknown2", "unknown10"] : ["recent", "older", "unknown2", "unknown10"]))
+    }
+
+    @Test func equalSizeNamesUseFinderOrderAcrossPages() async throws {
+        let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-sorting-" + UUID().uuidString)
+        let root: URL = fixture.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: fixture) }
+            catch { Issue.record(error) }
+        }
+        for name: String in ["file10", "file2", "file1"] {
+            try Data([1]).write(to: root.appendingPathComponent(name))
+        }
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.appendingPathComponent("cache/index.sqlite"))
+        _ = try await index.refresh(root: root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let first: [IndexedNode] = try await index.children(root: root.path, directory: Data(root.path.utf8), offset: 0, limit: 2)
+        let second: [IndexedNode] = try await index.children(root: root.path, directory: Data(root.path.utf8), offset: 2, limit: 2)
+        #expect((first + second).map { String(decoding: $0.entry.name, as: UTF8.self) } == ["file1", "file2", "file10"])
+    }
+
+    @Test func indexProgressIsMonotonicAndCompletesAfterFilesystemWork() async throws {
+        let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root: URL = fixture.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("a/deep"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("b"), withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.appendingPathComponent("cache/index.sqlite"))
+        let events: Mutex<[IndexEvent]> = Mutex([])
+        let summary: IndexSummary = try await index.refresh(root: root.path, mode: .full, receiveEvent: { event in events.withLock { $0.append(event) } }, isCancelled: { false })
+        let captured: [IndexEvent] = events.withLock { $0 }
+        let fractions: [Double] = captured.compactMap { event in
+            if case let .progress(progress) = event { return progress.completionFraction }
+            return nil
+        }
+        #expect(fractions.contains { $0 > 0 && $0 < 1 })
+        #expect(fractions.last == 1)
+        #expect(fractions.allSatisfy { $0 >= 0 && $0 <= 1 })
+        #expect(zip(fractions, fractions.dropFirst()).allSatisfy { $0 <= $1 })
+        guard case .completed = captured.last else { Issue.record("Missing committed completion event"); return }
+        #expect(try await index.cachedSummary(root: root.path)?.revision == summary.revision)
+
+        events.withLock { $0.removeAll() }
+        _ = try await index.refresh(root: root.path, mode: .directories([Data(root.appendingPathComponent("a").path.utf8), Data(root.appendingPathComponent("b").path.utf8)]), receiveEvent: { event in events.withLock { $0.append(event) } }, isCancelled: { false })
+        let incremental: [Double] = events.withLock { captured in
+            captured.compactMap { event in
+                if case let .progress(progress) = event { return progress.completionFraction }
+                return nil
+            }
+        }
+        #expect(incremental.contains { $0 > 0 && $0 < 0.75 })
+        #expect(incremental.last == 1)
+        #expect(zip(incremental, incremental.dropFirst()).allSatisfy { $0 <= $1 })
+        let incrementalEvents: [IndexEvent] = events.withLock { $0 }
+        let observedEntries: Int64 = incrementalEvents.reduce(0) { total, event in
+            if case let .batch(entries) = event { return total + Int64(entries.count) }
+            return total
+        }
+        let finalProgress: IndexProgress? = incrementalEvents.compactMap { event in
+            if case let .progress(progress) = event { return progress }
+            return nil
+        }.last
+        #expect(finalProgress?.entriesObserved == observedEntries)
+    }
+
+    @Test func incrementalProgressWaitsForNewSubtrees() async throws {
+        let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root: URL = fixture.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.appendingPathComponent("cache/index.sqlite"))
+        _ = try await index.refresh(root: root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let file: URL = root.appendingPathComponent("new/deep/file")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data([1]).write(to: file)
+        let events: Mutex<[IndexEvent]> = Mutex([])
+        _ = try await index.refresh(root: root.path, mode: .directories([Data(root.path.utf8)]), receiveEvent: { event in events.withLock { $0.append(event) } }, isCancelled: { false })
+        let captured: [IndexEvent] = events.withLock { $0 }
+        let fileBatch: Int = try #require(captured.firstIndex { event in
+            if case let .batch(entries) = event { return entries.contains { $0.path == Data(file.path.utf8) } }
+            return false
+        })
+        #expect(captured[..<fileBatch].contains { event in
+            if case let .progress(progress) = event { return progress.completionFraction > 0 && progress.completionFraction < 1 }
+            return false
+        })
+        #expect(!captured[..<fileBatch].contains { event in
+            if case let .progress(progress) = event { return progress.completionFraction == 1 }
+            return false
+        })
+        #expect(try await index.node(root: root.path, path: Data(file.path.utf8)) != nil)
+    }
+
+    @Test func cancellationRetainsPartialProgressAndCommittedSnapshot() async throws {
+        let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root: URL = fixture.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("child"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.appendingPathComponent("cache/index.sqlite"))
+        let previous: IndexSummary = try await index.refresh(root: root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let cancelled: Mutex<Bool> = Mutex(false)
+        let fractions: Mutex<[Double]> = Mutex([])
+        await #expect(throws: ScanError.cancelled) {
+            try await index.refresh(root: root.path, mode: .full, receiveEvent: { event in
+                if case let .progress(progress) = event {
+                    fractions.withLock { $0.append(progress.completionFraction) }
+                    if progress.completionFraction > 0 { cancelled.withLock { $0 = true } }
+                }
+            }, isCancelled: { cancelled.withLock { $0 } })
+        }
+        #expect(fractions.withLock { $0.contains { $0 > 0 && $0 < 1 } })
+        #expect(fractions.withLock { !$0.contains(1) })
+        #expect(try await index.cachedSummary(root: root.path)?.revision == previous.revision)
+    }
+
     @Test(.enabled(if: geteuid() != 0))
     func selectedRootPermissionDenialIsReportedAsScanFailure() async throws {
         let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

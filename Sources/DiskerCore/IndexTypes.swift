@@ -12,13 +12,21 @@ public struct IndexedNode: Codable, Equatable, Sendable {
     public let subtreeAllocatedBytes: UInt64
     public let subtreeNodeCount: Int64
     public let aliasTargetPath: Data?
+    public let lastOpenedDate: Date?
+
+    public var itemCount: Int64 { entry.metadata.kind == .directory ? max(0, subtreeNodeCount - 1) : 1 }
 
     public init(entry: ScanEntry, subtreeLogicalBytes: UInt64, subtreeAllocatedBytes: UInt64, subtreeNodeCount: Int64, aliasTargetPath: Data?) {
+        self.init(entry: entry, subtreeLogicalBytes: subtreeLogicalBytes, subtreeAllocatedBytes: subtreeAllocatedBytes, subtreeNodeCount: subtreeNodeCount, aliasTargetPath: aliasTargetPath, lastOpenedDate: nil)
+    }
+
+    public init(entry: ScanEntry, subtreeLogicalBytes: UInt64, subtreeAllocatedBytes: UInt64, subtreeNodeCount: Int64, aliasTargetPath: Data?, lastOpenedDate: Date?) {
         self.entry = entry
         self.subtreeLogicalBytes = subtreeLogicalBytes
         self.subtreeAllocatedBytes = subtreeAllocatedBytes
         self.subtreeNodeCount = subtreeNodeCount
         self.aliasTargetPath = aliasTargetPath
+        self.lastOpenedDate = lastOpenedDate
     }
 }
 
@@ -45,6 +53,16 @@ public struct IndexProgress: Sendable {
     public let allocatedBytesObserved: UInt64
     public let elapsedSeconds: Double
     public let previousNodeCount: Int64?
+    public let completionFraction: Double
+
+    public init(entriesObserved: Int64, logicalBytesObserved: UInt64, allocatedBytesObserved: UInt64, elapsedSeconds: Double, previousNodeCount: Int64?, completionFraction: Double) {
+        self.entriesObserved = entriesObserved
+        self.logicalBytesObserved = logicalBytesObserved
+        self.allocatedBytesObserved = allocatedBytesObserved
+        self.elapsedSeconds = elapsedSeconds
+        self.previousNodeCount = previousNodeCount
+        self.completionFraction = completionFraction
+    }
 }
 
 public enum IndexEvent: Sendable {

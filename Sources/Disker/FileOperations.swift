@@ -93,6 +93,16 @@ private func destinationURL(source: URL, directory: URL) throws -> URL {
 }
 
 @MainActor final class FileOperations {
+    nonisolated func lastOpenedDate(_ path: Data) async throws -> Date? {
+        try await Task.detached(priority: .utility) {
+            let url: URL = try fileURL(for: path)
+            do { return try fileLastOpenedDate(path: path) }
+            catch IndexError.invalidQuery(let diagnostic) {
+                throw FileOperationError.failed("Read date last opened", url, diagnostic)
+            }
+        }.value
+    }
+
     func open(_ item: FileItem) async throws {
         do { _ = try await NSWorkspace.shared.open(item.url, configuration: NSWorkspace.OpenConfiguration()) }
         catch { throw FileOperationError.failed("Open", item.url, String(describing: error)) }

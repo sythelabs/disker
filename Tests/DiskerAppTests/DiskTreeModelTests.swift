@@ -16,6 +16,11 @@ private enum TreeFixtureError: Error {
     case timedOut(String)
 }
 
+private enum TreePreviewReplay: CaseIterable, Sendable {
+    case branch
+    case rootDirectory
+}
+
 private func treeFixture() throws -> TreeFixture {
     let container: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-tree-" + UUID().uuidString).resolvingSymlinksInPath()
     let root: URL = container.appendingPathComponent("root")
@@ -63,6 +68,90 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
 
 @Suite("Disk tree model", .serialized)
 @MainActor struct DiskTreeModelTests {
+    @Test func columnSortingPreservesExpandedHierarchyAndRefreshOrder() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let folder2: URL = fixture.root.appendingPathComponent("folder2")
+        let folder10: URL = fixture.root.appendingPathComponent("folder10")
+        try treeFiles(directory: folder2, count: 12, bytes: 1)
+        try treeFiles(directory: folder10, count: 1, bytes: 65_536)
+        _ = try await cachedTree(fixture: fixture)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        await model.start()
+        try await waitForTreeScan(model)
+        await model.toggle(Data(folder2.path.utf8))
+        await model.toggle(Data(folder10.path.utf8))
+        let ids: Set<DiskTreeRowID> = Set(model.rows.map(\.id))
+        model.sortOrder = [DiskTreeSort(sort: NodeSort(column: .name, order: .forward))]
+        await model.sort()
+        #expect(model.rows.filter { $0.depth == 1 }.compactMap { $0.node.map { String(decoding: $0.entry.name, as: UTF8.self) } } == ["folder2", "folder10"])
+        let firstBranch: [DiskTreeRow] = Array(model.rows[2..<14])
+        #expect(firstBranch.allSatisfy { $0.node?.entry.parentPath == Data(folder2.path.utf8) && $0.depth == 2 })
+        #expect(firstBranch.compactMap { $0.node.map { String(decoding: $0.entry.name, as: UTF8.self) } } == (0..<12).map { "file-\($0)" })
+        #expect(Set(model.rows.map(\.id)) == ids)
+
+        model.sortOrder[0].order = .reverse
+        await model.sort()
+        #expect(model.rows[1].id == .node(Data(folder10.path.utf8)))
+        #expect(model.rows[2].node?.entry.parentPath == Data(folder10.path.utf8))
+        #expect(model.rows[3].id == .node(Data(folder2.path.utf8)))
+        #expect(model.rows[4].node?.entry.name == Data("file-11".utf8))
+        model.refresh()
+        try await waitForTreeScan(model)
+        #expect(model.rows[1].id == .node(Data(folder10.path.utf8)))
+        #expect(Set(model.rows.map(\.id)) == ids)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test func changingSortDuringPaginationDoesNotMixPageOrders() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root, count: 600, bytes: 1)
+        _ = try await cachedTree(fixture: fixture)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        await model.start()
+        try await waitForTreeScan(model)
+        model.sortOrder = [DiskTreeSort(sort: NodeSort(column: .name, order: .forward))]
+        await model.sort()
+        #expect(model.rows[1].node?.entry.name == Data("file-0".utf8))
+        #expect(model.rows[500].node?.entry.name == Data("file-499".utf8))
+        #expect(model.rows.last?.id == .more(Data(fixture.root.path.utf8)))
+
+        let pending: Task<Void, Never> = Task { await model.loadMore(Data(fixture.root.path.utf8)) }
+        await Task.yield()
+        model.sortOrder[0].order = .reverse
+        await model.sort()
+        await pending.value
+        await model.loadMore(Data(fixture.root.path.utf8))
+        let names: [String] = model.rows.dropFirst().compactMap { $0.node.map { String(decoding: $0.entry.name, as: UTF8.self) } }
+        #expect(names == (0..<600).reversed().map { "file-\($0)" })
+        #expect(Set(model.rows.map(\.id)).count == 601)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test func scanProgressFinishesAndResetsOnRefresh() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root.appendingPathComponent("folder/nested"), count: 3, bytes: 1)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        #expect(model.scanProgress == 0)
+        await model.start()
+        #expect(model.isScanning)
+        #expect(model.scanProgress == 0)
+        try await waitForTreeScan(model)
+        #expect(model.errorMessage == nil)
+        #expect(model.scanProgress == 1)
+        #expect(!model.isScanning)
+
+        model.refresh()
+        #expect(model.isScanning)
+        #expect(model.scanProgress == 0)
+        try await waitForTreeScan(model)
+        #expect(model.errorMessage == nil)
+        #expect(model.scanProgress == 1)
+        #expect(!model.isScanning)
+    }
+
     @Test func fileOperationRefreshUpdatesExpandedBranchesImmediately() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
@@ -84,7 +173,8 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.expanded.contains(Data(folder.path.utf8)))
     }
 
-    @Test func repeatedPreviewScopeDoesNotCountFilesTwice() async throws {
+    @Test(arguments: TreePreviewReplay.allCases)
+    fileprivate func repeatedPreviewScopeDoesNotCountFilesTwice(replay: TreePreviewReplay) async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
         let folder: URL = fixture.root.appendingPathComponent("folder")
@@ -97,8 +187,13 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         let buffer: TreeScanBuffer = TreeScanBuffer(root: rootEntry.path, capturePreview: true, limit: 500)
         buffer.receive(.batch([rootEntry, folderEntry, fileEntry]))
         let before: IndexedNode = try #require(buffer.snapshot().nodes.first)
-        let scope: ScanEntry = ScanEntry(path: folderEntry.path, parentPath: nil, name: folderEntry.name, metadata: folderEntry.metadata)
-        buffer.receive(.batch([scope, fileEntry]))
+        switch replay {
+        case .branch:
+            let scope: ScanEntry = ScanEntry(path: folderEntry.path, parentPath: nil, name: folderEntry.name, metadata: folderEntry.metadata)
+            buffer.receive(.batch([scope, fileEntry]))
+        case .rootDirectory:
+            buffer.receive(.batch([rootEntry, folderEntry]))
+        }
         let after: IndexedNode = try #require(buffer.snapshot().nodes.first)
         #expect(after.subtreeLogicalBytes == before.subtreeLogicalBytes)
         #expect(after.subtreeAllocatedBytes == before.subtreeAllocatedBytes)
@@ -147,6 +242,10 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         let after: TreeScanPreview = buffer.snapshot()
         #expect(after.nodes.map(\.entry.path) == before, "Growing sizes moved a different folder into the row being clicked")
         #expect(after.nodes.last?.subtreeAllocatedBytes == secondFile.metadata.allocatedBytes + second.metadata.allocatedBytes)
+        let sorted: TreeScanPreview = try after.sorted(using: NodeSort(column: .allocatedSize, order: .reverse))
+        #expect(sorted.nodes.map(\.entry.path) == [second.path, first.path])
+        #expect(sorted.totals.allocated == after.totals.allocated)
+        #expect(buffer.snapshot().nodes.map(\.entry.path) == before)
     }
 
     @Test func nestedFoldersAndFilesCollapseAndReexpandWithParentProportions() async throws {
@@ -246,7 +345,8 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         await model.start()
         try await waitForTreeScan(model)
         await model.loadMore(Data(fixture.root.path.utf8))
-        let selected: DiskTreeRowID = try #require(model.rows.last).id
+        let selected: DiskTreeRowID = .node(Data(fixture.root.appendingPathComponent("file-500").path.utf8))
+        #expect(model.rows.contains { $0.id == selected })
         #expect(model.rows.count == 511)
         if refreshedFileCount < 510 {
             for number: Int in refreshedFileCount..<510 {
@@ -355,6 +455,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.rows.count == 2)
         await model.chooseRoot(other)
         #expect(model.rootPath == other.path)
+        #expect(model.scanProgress == 0)
         #expect(model.summary?.logicalBytes == 7)
         #expect(model.rows.count == 2)
         #expect(model.isScanning)
@@ -386,6 +487,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         try await waitForTreeScan(model)
         #expect(model.scanStopped)
         #expect(!model.isScanning)
+        #expect(model.scanProgress < 1)
         #expect(model.errorMessage == nil)
         #expect(model.summary == previous)
         #expect(model.rows.count == 2)

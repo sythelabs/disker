@@ -29,6 +29,11 @@ public actor DiskIndex {
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA synchronous=FULL")
             try db.execute(sql: "PRAGMA temp_store=MEMORY")
+            db.add(collation: DatabaseCollation("finder_name") { $0.localizedStandardCompare($1) })
+            db.add(function: DatabaseFunction("file_last_opened", argumentCount: 1, pure: false) { values in
+                guard let path: Data = Data.fromDatabaseValue(values[0]) else { throw IndexError.invalidQuery("Date last opened requires raw path bytes") }
+                return try fileLastOpenedDate(path: path)?.timeIntervalSince1970
+            })
         }
         pool = try DatabasePool(path: databaseURL.path, configuration: configuration)
         let version: Int32 = try pool.read { db in try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0 }
@@ -92,11 +97,37 @@ public actor DiskIndex {
     }
 
     public nonisolated func children(root: String, directory: Data, offset: Int, limit: Int) async throws -> [IndexedNode] {
+        try await children(root: root, directory: directory, offset: offset, limit: limit, sort: NodeSort(column: .allocatedSize, order: .reverse))
+    }
+
+    public nonisolated func children(root: String, directory: Data, offset: Int, limit: Int, sort: NodeSort) async throws -> [IndexedNode] {
         guard offset >= 0, limit > 0, limit <= 10_000 else { throw IndexError.invalidQuery("offset must be >= 0 and limit must be 1 through 10000") }
         let normalized: String = normalizedRoot(root)
+        let direction: String = sort.order == .forward ? "ASC" : "DESC"
+        let names: String = "CAST(name AS TEXT) COLLATE finder_name, name, path"
+        let ordering: String
+        let opened: String
+        switch sort.column {
+        case .name:
+            ordering = "CAST(name AS TEXT) COLLATE finder_name \(direction), name \(direction), path \(direction)"
+            opened = "NULL"
+        case .allocatedSize, .sizeProportion:
+            ordering = "total_allocated \(direction), \(names)"
+            opened = "NULL"
+        case .items:
+            ordering = "CASE WHEN directory=1 THEN MAX(0,total_count-1) ELSE 1 END \(direction), \(names)"
+            opened = "NULL"
+        case .lastOpened:
+            ordering = "last_opened IS NULL, last_opened \(direction), \(names)"
+            opened = "file_last_opened(path)"
+        }
         return try await pool.read { db in
             let resolved: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
-            return try Row.fetchAll(db, sql: "SELECT *, (SELECT target FROM aliases a WHERE a.root=nodes.root AND a.path=nodes.path) AS alias_target FROM nodes INDEXED BY node_children WHERE root=? AND parent=? ORDER BY total_allocated DESC, name LIMIT ? OFFSET ?", arguments: [normalized, resolved, limit, offset]).map { try decodeNode($0) }
+            return try Row.fetchAll(db, sql: "SELECT *, \(opened) AS last_opened, (SELECT target FROM aliases a WHERE a.root=nodes.root AND a.path=nodes.path) AS alias_target FROM nodes INDEXED BY node_children WHERE root=? AND parent=? ORDER BY \(ordering) LIMIT ? OFFSET ?", arguments: [normalized, resolved, limit, offset]).map { row in
+                let node: IndexedNode = try decodeNode(row)
+                let timestamp: Double? = row["last_opened"]
+                return IndexedNode(entry: node.entry, subtreeLogicalBytes: node.subtreeLogicalBytes, subtreeAllocatedBytes: node.subtreeAllocatedBytes, subtreeNodeCount: node.subtreeNodeCount, aliasTargetPath: node.aliasTargetPath, lastOpenedDate: timestamp.map { Date(timeIntervalSince1970: $0) })
+            }
         }
     }
 
@@ -172,7 +203,7 @@ public actor DiskIndex {
         let exclusions: [Data] = cacheDirectories
         let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: normalized == "/" ? .crossDevices : .sameDevice, excludedPaths: exclusions)
         let start: ContinuousClock.Instant = ContinuousClock.now
-        let result: IndexSummary = try await withCacheWriterLock(at: writerLockURL, isCancelled: isCancelled, onWait: { receiveEvent(.waitingForWriter) }) {
+        let result: (summary: IndexSummary, progress: IndexProgress) = try await withCacheWriterLock(at: writerLockURL, isCancelled: isCancelled, onWait: { receiveEvent(.waitingForWriter) }) {
             receiveEvent(.writerAcquired)
             return try await self.pool.write { db in
                 let cached: IndexSummary? = try loadSummary(db: db, root: normalized)
@@ -200,7 +231,22 @@ public actor DiskIndex {
                 var observed: Int64 = 0
                 var logicalObserved: UInt64 = 0
                 var allocatedObserved: UInt64 = 0
+                var completionFraction: Double = 0
+                var lastProgressFraction: Double = -1
+                var lastProgressElapsed: Double = 0
                 var currentCheckpoint: JournalCheckpoint? = replay.checkpoint
+                func publishProgress() {
+                    let elapsed: Double = elapsedSeconds(start)
+                    lastProgressFraction = completionFraction
+                    lastProgressElapsed = elapsed
+                    receiveEvent(.progress(IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsed, previousNodeCount: cached?.nodeCount, completionFraction: completionFraction)))
+                }
+                func advanceProgress(_ weight: Double) {
+                    completionFraction = min(Double(1).nextDown, completionFraction + weight)
+                    if completionFraction - lastProgressFraction >= 0.002 || elapsedSeconds(start) - lastProgressElapsed >= 0.1 {
+                        publishProgress()
+                    }
+                }
                 let upsert: Statement = try db.makeStatement(sql: """
                     INSERT INTO nodes(root,path,parent,name,depth,directory,metadata,logical,allocated,total_logical,total_allocated,total_count,seen,modified_revision,total_revision)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
@@ -235,21 +281,27 @@ public actor DiskIndex {
                         allocatedObserved += entry.metadata.allocatedBytes
                     }
                     receiveEvent(.batch(batch))
-                    receiveEvent(.progress(IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsedSeconds(start), previousNodeCount: cached?.nodeCount)))
+                    publishProgress()
                 }
-                func scanTree(_ path: Data) throws {
+                func scanTree(_ path: Data, progressWeight: Double) throws {
                     try resetSeen(db: db, root: normalized, path: path)
                     let summary: ScanSummary
                     do {
-                        summary = try DirectoryScanner.scan(root: path, options: options, isCancelled: isCancelled, receiveBatch: apply)
+                        var previousFraction: Double = 0
+                        summary = try DirectoryScanner.scan(root: path, options: options, isCancelled: isCancelled, receiveProgress: { fraction in
+                            let increment: Double = max(0, fraction - previousFraction)
+                            previousFraction = max(previousFraction, fraction)
+                            advanceProgress(progressWeight * increment)
+                        }, receiveBatch: apply)
                     } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
-                        try scanDirectory(parentPath(path))
+                        try scanDirectory(parentPath(path), progressWeight: progressWeight)
                         return
                     } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
                         let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
                         issues.removeAll { $0.path == failedPath }
                         issues.append(issue)
                         try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
+                        advanceProgress(progressWeight)
                         return
                     }
                     metrics = addMetrics(metrics, summary.metrics)
@@ -263,16 +315,16 @@ public actor DiskIndex {
                     try removeUnseen(db: db, root: normalized, path: path, revision: revision)
                     try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
                 }
-                func scanDirectory(_ path: Data) throws {
-                    if exclusions.contains(where: { excludedPath(path, directory: $0) }) { return }
+                func scanDirectory(_ path: Data, progressWeight: Double) throws {
+                    if exclusions.contains(where: { excludedPath(path, directory: $0) }) { advanceProgress(progressWeight); return }
                     let existing: Row? = try Row.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path])
-                    guard existing != nil else { try scanTree(path); return }
+                    guard existing != nil else { try scanTree(path, progressWeight: progressWeight); return }
                     try db.execute(sql: "UPDATE nodes SET seen=0 WHERE root=? AND path=?", arguments: [normalized, path])
                     try db.execute(sql: "UPDATE nodes INDEXED BY node_children SET seen=0 WHERE root=? AND parent=?", arguments: [normalized, path])
                     var newDirectories: [Data] = []
                     let summary: ScanSummary
                     do {
-                        summary = try DirectoryScanner.enumerateDirectory(path: path, options: options, isCancelled: isCancelled) { batch in
+                        summary = try DirectoryScanner.enumerateDirectory(path: path, options: options, isCancelled: isCancelled, receiveProgress: { _ in }) { batch in
                             for entry: ScanEntry in batch where entry.metadata.kind == .directory && entry.path != path {
                                 let previous: Data? = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, entry.path])
                                 if let previous {
@@ -283,13 +335,14 @@ public actor DiskIndex {
                             try apply(batch)
                         }
                     } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
-                        try scanDirectory(parentPath(path))
+                        try scanDirectory(parentPath(path), progressWeight: progressWeight)
                         return
                     } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
                         let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
                         issues.removeAll { $0.path == failedPath }
                         issues.append(issue)
                         try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
+                        advanceProgress(progressWeight)
                         return
                     }
                     metrics = addMetrics(metrics, summary.metrics)
@@ -303,11 +356,14 @@ public actor DiskIndex {
                         try removeTree(db: db, root: normalized, path: obsolete, revision: revision)
                         issues.removeAll { $0.path == obsolete || isDescendant($0.path, of: obsolete) }
                     }
-                    for child: Data in newDirectories { try scanTree(child) }
+                    let childWeight: Double = progressWeight / Double(newDirectories.count + 1)
+                    advanceProgress(childWeight)
+                    for child: Data in newDirectories { try scanTree(child, progressWeight: childWeight) }
                     try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
                 }
-                func reconcile(_ update: JournalReplay) throws {
+                func reconcile(_ update: JournalReplay, progressWeight: Double) throws {
                     let recursive: [Data] = minimalPaths(try update.recursiveDirectories.map { try resolveAliasPath(db: db, root: normalized, path: Data($0.utf8)) }.filter { path in !exclusions.contains(where: { excludedPath(path, directory: $0) }) })
+                    advanceProgress(Double(update.recursiveDirectories.count - recursive.count) * progressWeight)
                     for path: Data in recursive {
                         if isCancelled() { throw ScanError.cancelled }
                         var metadata: stat = stat()
@@ -320,35 +376,45 @@ public actor DiskIndex {
                             try removeTree(db: db, root: normalized, path: path, revision: revision)
                             issues.removeAll { $0.path == path || isDescendant($0.path, of: path) }
                             try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
+                            advanceProgress(progressWeight)
                         } else if exists == 0 && metadata.st_mode & S_IFMT == S_IFDIR {
-                            try scanTree(path)
+                            try scanTree(path, progressWeight: progressWeight)
                         } else {
                             let parent: Data = parentPath(path)
-                            try scanDirectory(parent)
+                            try scanDirectory(parent, progressWeight: progressWeight)
                         }
                     }
                     for directory: String in update.dirtyDirectories {
                         let path: Data = try resolveAliasPath(db: db, root: normalized, path: Data(directory.utf8))
-                        if !recursive.contains(where: { path == $0 || isDescendant(path, of: $0) }) { try scanDirectory(path) }
+                        if !recursive.contains(where: { path == $0 || isDescendant(path, of: $0) }) {
+                            try scanDirectory(path, progressWeight: progressWeight)
+                        } else {
+                            advanceProgress(progressWeight)
+                        }
                     }
                 }
                 if mode == .full || cached == nil || replay.requiresFullScan || rootChanged {
-                    try scanTree(Data(normalized.utf8))
+                    try scanTree(Data(normalized.utf8), progressWeight: 0.95)
                 } else {
                     issues = cached?.issues ?? []
-                    try reconcile(replay)
-                    if case .directories(let directories) = mode {
-                        for directory: Data in minimalPaths(directories) {
-                            let path: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
-                            try scanDirectory(path)
-                        }
+                    let directories: [Data]
+                    if case .directories(let paths) = mode { directories = minimalPaths(paths) } else { directories = [] }
+                    let scopeCount: Int = replay.recursiveDirectories.count + replay.dirtyDirectories.count + directories.count
+                    let progressWeight: Double = scopeCount == 0 ? 0 : 0.95 / Double(scopeCount)
+                    try reconcile(replay, progressWeight: progressWeight)
+                    for directory: Data in directories {
+                        let path: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
+                        try scanDirectory(path, progressWeight: progressWeight)
                     }
                     let retryPaths: [Data] = minimalPaths(issues.filter { [.metadataUnavailable, .ioError, .changedDuringScan, .vanished].contains($0.kind) }.map(\.path))
-                    for path: Data in retryPaths {
-                        if try Bool.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path]) == true {
-                            try scanTree(path)
-                        } else {
-                            try scanDirectory(parentPath(path))
+                    if !retryPaths.isEmpty {
+                        let retryWeight: Double = (1 - completionFraction) * 0.95 / Double(retryPaths.count)
+                        for path: Data in retryPaths {
+                            if try Bool.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path]) == true {
+                                try scanTree(path, progressWeight: retryWeight)
+                            } else {
+                                try scanDirectory(parentPath(path), progressWeight: retryWeight)
+                            }
                         }
                     }
                 }
@@ -357,12 +423,14 @@ public actor DiskIndex {
                     let pending: JournalReplay = try journal.drain()
                     currentCheckpoint = pending.checkpoint
                     if pending.requiresFullScan {
-                        try scanTree(Data(normalized.utf8))
+                        try scanTree(Data(normalized.utf8), progressWeight: (1 - completionFraction) * 0.95)
                     } else if pending.dirtyDirectories.isEmpty && pending.recursiveDirectories.isEmpty {
                         settled = true
                         break
                     } else {
-                        try reconcile(pending)
+                        let scopeCount: Int = pending.recursiveDirectories.count + pending.dirtyDirectories.count
+                        let progressWeight: Double = (1 - completionFraction) * 0.95 / Double(scopeCount)
+                        try reconcile(pending, progressWeight: progressWeight)
                     }
                 }
                 guard settled else { throw IndexError.unstableFilesystem(normalized) }
@@ -372,11 +440,12 @@ public actor DiskIndex {
                 let blockingIssues: [ScanIssue] = issues.filter { $0.kind != .excluded && $0.kind != .directoryAlias && $0.kind != .mountBoundary }
                 let summary: IndexSummary = IndexSummary(root: normalized, logicalBytes: UInt64(row["total_logical"] as Int64), allocatedBytes: UInt64(row["total_allocated"] as Int64), nodeCount: row["total_count"], revision: revision, lastScanDate: Date(), isComplete: blockingIssues.isEmpty, issues: issues, metrics: metrics)
                 try db.execute(sql: "INSERT INTO roots(root,revision,summary,checkpoint) VALUES(?,?,?,?) ON CONFLICT(root) DO UPDATE SET revision=excluded.revision,summary=excluded.summary,checkpoint=excluded.checkpoint", arguments: [normalized, revision, try JSONEncoder().encode(summary), try currentCheckpoint.map { try JSONEncoder().encode($0) }])
-                return summary
+                return (summary: summary, progress: IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsedSeconds(start), previousNodeCount: cached?.nodeCount, completionFraction: 1))
             }
         }
-        receiveEvent(.completed(result))
-        return result
+        receiveEvent(.progress(result.progress))
+        receiveEvent(.completed(result.summary))
+        return result.summary
     }
 }
 
