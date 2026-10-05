@@ -49,6 +49,7 @@ final class DiskTreeModel {
     private(set) var rootPath: String
     private(set) var summary: IndexSummary?
     private(set) var isScanning: Bool = false
+    private(set) var isWaitingForWriter: Bool = false
     private(set) var scannedEntries: Int64 = 0
     private(set) var errorMessage: String?
     private(set) var scanStopped: Bool = false
@@ -91,7 +92,7 @@ final class DiskTreeModel {
         let ticket: UInt64 = generation
         let database: URL = cacheURL
         do {
-            let opened: DiskIndex = try await Task.detached(priority: .utility) { try DiskIndex(databaseURL: database) }.value
+            let opened: DiskIndex = try await DiskIndex.open(databaseURL: database)
             guard ticket == generation, !Task.isCancelled else { return }
             index = opened
             try await reloadSnapshot(ticket: ticket)
@@ -106,6 +107,7 @@ final class DiskTreeModel {
         cancelScan()
         generation += 1
         isScanning = false
+        isWaitingForWriter = false
         scanTask = nil
         scanBuffer = nil
         rootPath = url.standardizedFileURL.path
@@ -147,6 +149,7 @@ final class DiskTreeModel {
         let buffer: TreeScanBuffer = TreeScanBuffer(root: Data(root.utf8), capturePreview: summary == nil, limit: pageSize)
         scanBuffer = buffer
         isScanning = true
+        isWaitingForWriter = false
         scanStopped = false
         scannedEntries = 0
         errorMessage = nil
@@ -173,6 +176,7 @@ final class DiskTreeModel {
             }
             guard ticket == generation else { return }
             isScanning = false
+            isWaitingForWriter = false
             scanTask = nil
             scanBuffer = nil
         }
@@ -180,6 +184,7 @@ final class DiskTreeModel {
 
     func cancelScan() {
         scanBuffer?.cancel()
+        isWaitingForWriter = false
     }
 
     func toggle(_ path: Data) async {
@@ -263,6 +268,7 @@ final class DiskTreeModel {
 
     private func applyPreview(_ preview: TreeScanPreview, ticket: UInt64) {
         guard ticket == generation, isScanning else { return }
+        isWaitingForWriter = preview.isWaitingForWriter && scanBuffer?.isCancelled == false
         scannedEntries = preview.progress?.entriesObserved ?? scannedEntries
         guard summary == nil, let root: ScanEntry = preview.root else { return }
         let logical: UInt64 = preview.progress?.logicalBytesObserved ?? 0
@@ -276,6 +282,7 @@ struct TreeScanPreview: Sendable {
     let root: ScanEntry?
     let nodes: [IndexedNode]
     let progress: IndexProgress?
+    let isWaitingForWriter: Bool
 }
 
 private struct PreviewTotals: Sendable {
@@ -286,6 +293,7 @@ private struct PreviewTotals: Sendable {
 
 private struct TreeScanState: Sendable {
     var cancelled: Bool
+    var isWaitingForWriter: Bool
     var root: ScanEntry?
     var entries: [Data: ScanEntry]
     var entryOrder: [Data]
@@ -305,16 +313,23 @@ final class TreeScanBuffer: Sendable {
         prefix = root.last == 47 ? root : root + Data([47])
         self.capturePreview = capturePreview
         self.limit = limit
-        state = Mutex(TreeScanState(cancelled: false, root: nil, entries: [:], entryOrder: [], totals: [:], progress: nil))
+        state = Mutex(TreeScanState(cancelled: false, isWaitingForWriter: false, root: nil, entries: [:], entryOrder: [], totals: [:], progress: nil))
     }
 
     var isCancelled: Bool { state.withLock { $0.cancelled } }
 
-    func cancel() { state.withLock { $0.cancelled = true } }
+    func cancel() {
+        state.withLock {
+            $0.cancelled = true
+            $0.isWaitingForWriter = false
+        }
+    }
 
     func receive(_ event: IndexEvent) {
         state.withLock { state in
             switch event {
+            case .waitingForWriter: state.isWaitingForWriter = !state.cancelled
+            case .writerAcquired: state.isWaitingForWriter = false
             case .progress(let progress): state.progress = progress
             case .batch(let entries):
                 guard capturePreview else { return }
@@ -337,7 +352,7 @@ final class TreeScanBuffer: Sendable {
                     totals.count += 1
                     state.totals[top] = totals
                 }
-            case .started, .completed: break
+            case .started, .completed: state.isWaitingForWriter = false
             }
         }
     }
@@ -349,7 +364,7 @@ final class TreeScanBuffer: Sendable {
                 let totals: PreviewTotals = state.totals[entry.path]!
                 return IndexedNode(entry: entry, subtreeLogicalBytes: totals.logical, subtreeAllocatedBytes: totals.allocated, subtreeNodeCount: totals.count, aliasTargetPath: nil)
             }
-            return TreeScanPreview(root: state.root, nodes: nodes, progress: state.progress)
+            return TreeScanPreview(root: state.root, nodes: nodes, progress: state.progress, isWaitingForWriter: state.isWaitingForWriter)
         }
     }
 }

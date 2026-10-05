@@ -147,6 +147,10 @@ private final class ProgressWriter: @unchecked Sendable {
         guard failure == nil else { return }
         let record: ProgressRecord
         switch event {
+        case .waitingForWriter:
+            record = ProgressRecord(event: "waiting_for_writer", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: nil, isComplete: nil)
+        case .writerAcquired:
+            record = ProgressRecord(event: "writer_acquired", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: nil, isComplete: nil)
         case let .started(cached):
             record = ProgressRecord(event: "started", root: root, entriesObserved: nil, logicalBytesObserved: nil, elapsedSeconds: nil, previousNodeCount: cached?.nodeCount, isComplete: cached?.isComplete)
         case .batch:

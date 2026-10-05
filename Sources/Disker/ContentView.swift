@@ -479,8 +479,12 @@ private struct TreeScanStatus: View {
             HStack {
                 if model.isScanning {
                     ProgressView().controlSize(.small)
-                    Text("Scanning - \(model.scannedEntries.formatted()) items observed")
-                    Text("Sizes are preliminary").foregroundStyle(.secondary)
+                    if model.isWaitingForWriter {
+                        Text("Waiting for another scan")
+                    } else {
+                        Text("Scanning - \(model.scannedEntries.formatted()) items observed")
+                        Text("Sizes are preliminary").foregroundStyle(.secondary)
+                    }
                 } else if model.scanStopped { Text("Scan stopped") }
                 else if let summary: IndexSummary = model.summary {
                     Text("\(summary.nodeCount.formatted()) items")

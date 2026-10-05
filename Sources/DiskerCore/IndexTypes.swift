@@ -49,6 +49,8 @@ public struct IndexProgress: Sendable {
 
 public enum IndexEvent: Sendable {
     case started(cached: IndexSummary?)
+    case waitingForWriter
+    case writerAcquired
     case batch([ScanEntry])
     case progress(IndexProgress)
     case completed(IndexSummary)

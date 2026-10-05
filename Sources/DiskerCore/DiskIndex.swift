@@ -1,16 +1,29 @@
 import Darwin
+import Dispatch
 import Foundation
 import GRDB
 
 public actor DiskIndex {
     private let pool: DatabasePool
     private let cacheDirectories: [Data]
+    private let writerLockURL: URL
+
+    public nonisolated static func open(databaseURL: URL) async throws -> DiskIndex {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DiskIndex, any Error>) in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(with: Result { try DiskIndex(databaseURL: databaseURL) })
+            }
+        }
+    }
 
     public init(databaseURL: URL) throws {
         let directory: URL = databaseURL.deletingLastPathComponent().standardizedFileURL
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let resolvedDirectory: String = directory.resolvingSymlinksInPath().path
         cacheDirectories = [Data(directory.path.utf8), Data(resolvedDirectory.utf8), Data(try physicalDirectoryPath(resolvedDirectory).utf8)]
+        let resolvedDatabase: URL = databaseURL.standardizedFileURL.resolvingSymlinksInPath()
+        let lockDirectory: String = try physicalDirectoryPath(resolvedDatabase.deletingLastPathComponent().path)
+        writerLockURL = URL(fileURLWithPath: lockDirectory, isDirectory: true).appendingPathComponent(resolvedDatabase.lastPathComponent + ".write-lock", isDirectory: false)
         var configuration: Configuration = Configuration()
         configuration.busyMode = .timeout(5)
         configuration.prepareDatabase { db in
@@ -21,37 +34,44 @@ public actor DiskIndex {
         let version: Int32 = try pool.read { db in try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0 }
         guard version == 0 || version == 1 else { throw IndexError.incompatibleSchema(version) }
         if version == 0 {
-            try pool.write { db in
-                let currentVersion: Int32 = try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0
+            let opened: DatabasePool = pool
+            try bootstrapCacheWithWriterLock(at: writerLockURL, isReady: {
+                let currentVersion: Int32 = try opened.read { db in try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0 }
                 guard currentVersion == 0 || currentVersion == 1 else { throw IndexError.incompatibleSchema(currentVersion) }
-                guard currentVersion == 0 else { return }
-                try db.execute(sql: """
-                    CREATE TABLE IF NOT EXISTS roots (
-                        root TEXT PRIMARY KEY, revision INTEGER NOT NULL, summary BLOB NOT NULL, checkpoint BLOB
-                    );
-                    CREATE TABLE IF NOT EXISTS nodes (
-                        root TEXT NOT NULL, path BLOB NOT NULL, parent BLOB, name BLOB NOT NULL,
-                        depth INTEGER NOT NULL, directory INTEGER NOT NULL, metadata BLOB NOT NULL,
-                        logical INTEGER NOT NULL, allocated INTEGER NOT NULL,
-                        total_logical INTEGER NOT NULL, total_allocated INTEGER NOT NULL,
-                        total_count INTEGER NOT NULL, seen INTEGER NOT NULL,
-                        modified_revision INTEGER NOT NULL, total_revision INTEGER NOT NULL,
-                        PRIMARY KEY (root, path)
-                    ) WITHOUT ROWID;
-                    CREATE INDEX IF NOT EXISTS node_children ON nodes(root, parent, total_allocated DESC, name);
-                    CREATE INDEX IF NOT EXISTS node_depth ON nodes(root, depth);
-                    CREATE INDEX IF NOT EXISTS node_git_markers ON nodes(root, name);
-                    CREATE TABLE IF NOT EXISTS aliases (
-                        root TEXT NOT NULL, path BLOB NOT NULL, target BLOB NOT NULL, seen INTEGER NOT NULL,
-                        PRIMARY KEY(root,path)
-                    ) WITHOUT ROWID;
-                    CREATE TABLE IF NOT EXISTS git_cache (
-                        root TEXT NOT NULL, path TEXT NOT NULL, revision INTEGER NOT NULL,
-                        fingerprint BLOB NOT NULL, info BLOB NOT NULL, PRIMARY KEY(root, path)
-                    ) WITHOUT ROWID;
-                    PRAGMA user_version=1;
-                    """)
-            }
+                return currentVersion == 1
+            }, bootstrap: {
+                try opened.write { db in
+                    let currentVersion: Int32 = try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0
+                    guard currentVersion == 0 || currentVersion == 1 else { throw IndexError.incompatibleSchema(currentVersion) }
+                    guard currentVersion == 0 else { return }
+                    try db.execute(sql: """
+                        CREATE TABLE IF NOT EXISTS roots (
+                            root TEXT PRIMARY KEY, revision INTEGER NOT NULL, summary BLOB NOT NULL, checkpoint BLOB
+                        );
+                        CREATE TABLE IF NOT EXISTS nodes (
+                            root TEXT NOT NULL, path BLOB NOT NULL, parent BLOB, name BLOB NOT NULL,
+                            depth INTEGER NOT NULL, directory INTEGER NOT NULL, metadata BLOB NOT NULL,
+                            logical INTEGER NOT NULL, allocated INTEGER NOT NULL,
+                            total_logical INTEGER NOT NULL, total_allocated INTEGER NOT NULL,
+                            total_count INTEGER NOT NULL, seen INTEGER NOT NULL,
+                            modified_revision INTEGER NOT NULL, total_revision INTEGER NOT NULL,
+                            PRIMARY KEY (root, path)
+                        ) WITHOUT ROWID;
+                        CREATE INDEX IF NOT EXISTS node_children ON nodes(root, parent, total_allocated DESC, name);
+                        CREATE INDEX IF NOT EXISTS node_depth ON nodes(root, depth);
+                        CREATE INDEX IF NOT EXISTS node_git_markers ON nodes(root, name);
+                        CREATE TABLE IF NOT EXISTS aliases (
+                            root TEXT NOT NULL, path BLOB NOT NULL, target BLOB NOT NULL, seen INTEGER NOT NULL,
+                            PRIMARY KEY(root,path)
+                        ) WITHOUT ROWID;
+                        CREATE TABLE IF NOT EXISTS git_cache (
+                            root TEXT NOT NULL, path TEXT NOT NULL, revision INTEGER NOT NULL,
+                            fingerprint BLOB NOT NULL, info BLOB NOT NULL, PRIMARY KEY(root, path)
+                        ) WITHOUT ROWID;
+                        PRAGMA user_version=1;
+                        """)
+                }
+            })
         }
     }
 
@@ -127,11 +147,13 @@ public actor DiskIndex {
         }.value
         guard let info: GitRepositoryInfo = enriched.0 else { return nil }
         guard enriched.1 == fingerprint, try await cachedSummary(root: normalized)?.revision == summary.revision else { throw IndexError.staleEnrichment(repositoryPath) }
-        try await pool.write { db in
-            let currentRevision: Int64? = try Int64.fetchOne(db, sql: "SELECT total_revision FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(repositoryPath.utf8)])
-            guard currentRevision == snapshotRevision else { throw IndexError.staleEnrichment(repositoryPath) }
-            guard try Int64.fetchOne(db, sql: "SELECT revision FROM roots WHERE root=?", arguments: [normalized]) == summary.revision else { throw IndexError.staleEnrichment(repositoryPath) }
-            try db.execute(sql: "INSERT INTO git_cache(root,path,revision,fingerprint,info) VALUES(?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET revision=excluded.revision,fingerprint=excluded.fingerprint,info=excluded.info", arguments: [normalized, repositoryPath, snapshotRevision, try JSONEncoder().encode(fingerprint), try JSONEncoder().encode(info)])
+        try await withCacheWriterLock(at: writerLockURL, isCancelled: { Task.isCancelled }, onWait: {}) {
+            try await self.pool.write { db in
+                let currentRevision: Int64? = try Int64.fetchOne(db, sql: "SELECT total_revision FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(repositoryPath.utf8)])
+                guard currentRevision == snapshotRevision else { throw IndexError.staleEnrichment(repositoryPath) }
+                guard try Int64.fetchOne(db, sql: "SELECT revision FROM roots WHERE root=?", arguments: [normalized]) == summary.revision else { throw IndexError.staleEnrichment(repositoryPath) }
+                try db.execute(sql: "INSERT INTO git_cache(root,path,revision,fingerprint,info) VALUES(?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET revision=excluded.revision,fingerprint=excluded.fingerprint,info=excluded.info", arguments: [normalized, repositoryPath, snapshotRevision, try JSONEncoder().encode(fingerprint), try JSONEncoder().encode(info)])
+            }
         }
         return CachedGitInfo(info: info, wasCached: false)
     }
@@ -150,205 +172,208 @@ public actor DiskIndex {
         let exclusions: [Data] = cacheDirectories
         let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: normalized == "/" ? .crossDevices : .sameDevice, excludedPaths: exclusions)
         let start: ContinuousClock.Instant = ContinuousClock.now
-        let result: IndexSummary = try await pool.write { db in
-            let cached: IndexSummary? = try loadSummary(db: db, root: normalized)
-            let revision: Int64 = (cached?.revision ?? 0) + 1
-            let checkpointData: Data? = try Data.fetchOne(db, sql: "SELECT checkpoint FROM roots WHERE root=?", arguments: [normalized])
-            let checkpoint: JournalCheckpoint? = try checkpointData.map { try JSONDecoder().decode(JournalCheckpoint.self, from: $0) }
-            let journal: FileEventJournal
-            do {
-                journal = try FileEventJournal(rootPath: normalized, checkpoint: checkpoint, latency: 0.05)
-            } catch FileEventJournalError.filesystem(let operation, let path, let code) {
-                throw ScanError.systemCall(path: Data(path.utf8), operation: operation, errnoCode: code)
-            }
-            defer { journal.stop() }
-            let replay: JournalReplay = try journal.replay(timeout: 10)
-            var rootChanged: Bool = false
-            if let previous: Data = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(normalized.utf8)]) {
-                let saved: FileMetadata = try decodeMetadata(previous)
-                var live: stat = stat()
-                guard stat(normalized, &live) == 0 else { throw ScanError.systemCall(path: Data(normalized.utf8), operation: "stat", errnoCode: errno) }
-                rootChanged = saved.device != UInt64(UInt32(bitPattern: live.st_dev)) || saved.inode != UInt64(live.st_ino) || saved.birthTime.seconds != Int64(live.st_birthtimespec.tv_sec) || saved.birthTime.nanoseconds != Int32(live.st_birthtimespec.tv_nsec)
-            }
-            try db.execute(sql: "CREATE TEMP TABLE IF NOT EXISTS dirty(path BLOB PRIMARY KEY, depth INTEGER NOT NULL) WITHOUT ROWID; DELETE FROM dirty")
-            var metrics: ScanMetrics = ScanMetrics(entries: 0, directories: 0, bulkCalls: 0, metadataCalls: 0, contentBytesRead: 0)
-            var issues: [ScanIssue] = []
-            var observed: Int64 = 0
-            var logicalObserved: UInt64 = 0
-            var allocatedObserved: UInt64 = 0
-            var currentCheckpoint: JournalCheckpoint? = replay.checkpoint
-            let upsert: Statement = try db.makeStatement(sql: """
-                INSERT INTO nodes(root,path,parent,name,depth,directory,metadata,logical,allocated,total_logical,total_allocated,total_count,seen,modified_revision,total_revision)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
-                ON CONFLICT(root,path) DO UPDATE SET parent=excluded.parent,name=excluded.name,depth=excluded.depth,
-                    directory=excluded.directory,metadata=excluded.metadata,logical=excluded.logical,
-                    allocated=excluded.allocated,seen=excluded.seen,
-                    total_logical=CASE WHEN excluded.directory=0 THEN excluded.logical ELSE nodes.total_logical END,
-                    total_allocated=CASE WHEN excluded.directory=0 THEN excluded.allocated ELSE nodes.total_allocated END,
-                    total_count=CASE WHEN excluded.directory=0 THEN 1 ELSE nodes.total_count END,
-                    modified_revision=CASE WHEN substr(nodes.metadata,1,120)<>substr(excluded.metadata,1,120) OR substr(nodes.metadata,137)<>substr(excluded.metadata,137) THEN excluded.modified_revision ELSE nodes.modified_revision END,
-                    total_revision=CASE WHEN excluded.directory=0 AND (substr(nodes.metadata,1,120)<>substr(excluded.metadata,1,120) OR substr(nodes.metadata,137)<>substr(excluded.metadata,137)) THEN excluded.total_revision ELSE nodes.total_revision END
-                """)
-            let markDirty: Statement = try db.makeStatement(sql: "INSERT OR IGNORE INTO dirty(path,depth) VALUES(?,?)")
-            let previousDirectory: Statement = try db.makeStatement(sql: "SELECT directory FROM nodes WHERE root=? AND path=?")
-            func apply(_ batch: [ScanEntry]) throws {
-                for entry: ScanEntry in batch {
-                    let directory: Bool = entry.metadata.kind == .directory
-                    let logical: UInt64 = directory ? 0 : entry.metadata.logicalBytes
-                    guard logical <= Int64.max, entry.metadata.allocatedBytes <= Int64.max else { throw IndexError.malformedCache("File size exceeds SQLite integer range") }
-                    if !directory, let wasDirectory: Bool = try Bool.fetchOne(previousDirectory, arguments: [normalized, entry.path]), wasDirectory {
-                        let (lower, upper): (Data, Data) = prefixRange(entry.path)
-                        try db.execute(sql: "DELETE FROM nodes WHERE root=? AND path>=? AND path<?", arguments: [normalized, lower, upper])
-                        try db.execute(sql: "DELETE FROM aliases WHERE root=? AND (path=? OR (path>=? AND path<?) OR target=? OR (target>=? AND target<?))", arguments: [normalized, entry.path, lower, upper, entry.path, lower, upper])
-                        issues.removeAll { $0.path == entry.path || isDescendant($0.path, of: entry.path) }
-                    }
-                    let parent: Data? = entry.path == Data(normalized.utf8) ? nil : (entry.parentPath ?? parentPath(entry.path))
-                    try upsert.execute(arguments: [normalized, entry.path, parent, entry.name, pathDepth(entry.path), directory, encodeMetadata(entry.metadata), Int64(logical), Int64(entry.metadata.allocatedBytes), Int64(logical), Int64(entry.metadata.allocatedBytes), revision, revision, revision])
-                    if directory { try markDirty.execute(arguments: [entry.path, pathDepth(entry.path)]) }
-                    if let parent { try markDirty.execute(arguments: [parent, pathDepth(parent)]) }
-                    observed += 1
-                    logicalObserved += logical
-                    allocatedObserved += entry.metadata.allocatedBytes
-                }
-                receiveEvent(.batch(batch))
-                receiveEvent(.progress(IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsedSeconds(start), previousNodeCount: cached?.nodeCount)))
-            }
-            func scanTree(_ path: Data) throws {
-                try resetSeen(db: db, root: normalized, path: path)
-                let summary: ScanSummary
+        let result: IndexSummary = try await withCacheWriterLock(at: writerLockURL, isCancelled: isCancelled, onWait: { receiveEvent(.waitingForWriter) }) {
+            receiveEvent(.writerAcquired)
+            return try await self.pool.write { db in
+                let cached: IndexSummary? = try loadSummary(db: db, root: normalized)
+                let revision: Int64 = (cached?.revision ?? 0) + 1
+                let checkpointData: Data? = try Data.fetchOne(db, sql: "SELECT checkpoint FROM roots WHERE root=?", arguments: [normalized])
+                let checkpoint: JournalCheckpoint? = try checkpointData.map { try JSONDecoder().decode(JournalCheckpoint.self, from: $0) }
+                let journal: FileEventJournal
                 do {
-                    summary = try DirectoryScanner.scan(root: path, options: options, isCancelled: isCancelled, receiveBatch: apply)
-                } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
-                    try scanDirectory(parentPath(path))
-                    return
-                } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
-                    let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
-                    issues.removeAll { $0.path == failedPath }
-                    issues.append(issue)
-                    try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
-                    return
+                    journal = try FileEventJournal(rootPath: normalized, checkpoint: checkpoint, latency: 0.05)
+                } catch FileEventJournalError.filesystem(let operation, let path, let code) {
+                    throw ScanError.systemCall(path: Data(path.utf8), operation: operation, errnoCode: code)
                 }
-                metrics = addMetrics(metrics, summary.metrics)
-                issues.removeAll { $0.path == path || isDescendant($0.path, of: path) }
-                issues += summary.issues
-                for alias: ScanAlias in summary.aliases {
-                    try db.execute(sql: "INSERT INTO aliases(root,path,target,seen) VALUES(?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET target=excluded.target,seen=excluded.seen", arguments: [normalized, alias.aliasPath, alias.targetPath, revision])
+                defer { journal.stop() }
+                let replay: JournalReplay = try journal.replay(timeout: 10)
+                var rootChanged: Bool = false
+                if let previous: Data = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(normalized.utf8)]) {
+                    let saved: FileMetadata = try decodeMetadata(previous)
+                    var live: stat = stat()
+                    guard stat(normalized, &live) == 0 else { throw ScanError.systemCall(path: Data(normalized.utf8), operation: "stat", errnoCode: errno) }
+                    rootChanged = saved.device != UInt64(UInt32(bitPattern: live.st_dev)) || saved.inode != UInt64(live.st_ino) || saved.birthTime.seconds != Int64(live.st_birthtimespec.tv_sec) || saved.birthTime.nanoseconds != Int32(live.st_birthtimespec.tv_nsec)
                 }
-                try preserveUnreachable(db: db, root: normalized, issues: summary.issues, revision: revision)
-                try markRemovedParents(db: db, root: normalized, path: path, revision: revision)
-                try removeUnseen(db: db, root: normalized, path: path, revision: revision)
-                try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
-            }
-            func scanDirectory(_ path: Data) throws {
-                if exclusions.contains(where: { excludedPath(path, directory: $0) }) { return }
-                let existing: Row? = try Row.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path])
-                guard existing != nil else { try scanTree(path); return }
-                try db.execute(sql: "UPDATE nodes SET seen=0 WHERE root=? AND path=?", arguments: [normalized, path])
-                try db.execute(sql: "UPDATE nodes INDEXED BY node_children SET seen=0 WHERE root=? AND parent=?", arguments: [normalized, path])
-                var newDirectories: [Data] = []
-                let summary: ScanSummary
-                do {
-                    summary = try DirectoryScanner.enumerateDirectory(path: path, options: options, isCancelled: isCancelled) { batch in
-                        for entry: ScanEntry in batch where entry.metadata.kind == .directory && entry.path != path {
-                            let previous: Data? = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, entry.path])
-                            if let previous {
-                                let metadata: FileMetadata = try decodeMetadata(previous)
-                                if metadata.kind != .directory || metadata.device != entry.metadata.device || metadata.inode != entry.metadata.inode { newDirectories.append(entry.path) }
-                            } else { newDirectories.append(entry.path) }
+                try db.execute(sql: "CREATE TEMP TABLE IF NOT EXISTS dirty(path BLOB PRIMARY KEY, depth INTEGER NOT NULL) WITHOUT ROWID; DELETE FROM dirty")
+                var metrics: ScanMetrics = ScanMetrics(entries: 0, directories: 0, bulkCalls: 0, metadataCalls: 0, contentBytesRead: 0)
+                var issues: [ScanIssue] = []
+                var observed: Int64 = 0
+                var logicalObserved: UInt64 = 0
+                var allocatedObserved: UInt64 = 0
+                var currentCheckpoint: JournalCheckpoint? = replay.checkpoint
+                let upsert: Statement = try db.makeStatement(sql: """
+                    INSERT INTO nodes(root,path,parent,name,depth,directory,metadata,logical,allocated,total_logical,total_allocated,total_count,seen,modified_revision,total_revision)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
+                    ON CONFLICT(root,path) DO UPDATE SET parent=excluded.parent,name=excluded.name,depth=excluded.depth,
+                        directory=excluded.directory,metadata=excluded.metadata,logical=excluded.logical,
+                        allocated=excluded.allocated,seen=excluded.seen,
+                        total_logical=CASE WHEN excluded.directory=0 THEN excluded.logical ELSE nodes.total_logical END,
+                        total_allocated=CASE WHEN excluded.directory=0 THEN excluded.allocated ELSE nodes.total_allocated END,
+                        total_count=CASE WHEN excluded.directory=0 THEN 1 ELSE nodes.total_count END,
+                        modified_revision=CASE WHEN substr(nodes.metadata,1,120)<>substr(excluded.metadata,1,120) OR substr(nodes.metadata,137)<>substr(excluded.metadata,137) THEN excluded.modified_revision ELSE nodes.modified_revision END,
+                        total_revision=CASE WHEN excluded.directory=0 AND (substr(nodes.metadata,1,120)<>substr(excluded.metadata,1,120) OR substr(nodes.metadata,137)<>substr(excluded.metadata,137)) THEN excluded.total_revision ELSE nodes.total_revision END
+                    """)
+                let markDirty: Statement = try db.makeStatement(sql: "INSERT OR IGNORE INTO dirty(path,depth) VALUES(?,?)")
+                let previousDirectory: Statement = try db.makeStatement(sql: "SELECT directory FROM nodes WHERE root=? AND path=?")
+                func apply(_ batch: [ScanEntry]) throws {
+                    for entry: ScanEntry in batch {
+                        let directory: Bool = entry.metadata.kind == .directory
+                        let logical: UInt64 = directory ? 0 : entry.metadata.logicalBytes
+                        guard logical <= Int64.max, entry.metadata.allocatedBytes <= Int64.max else { throw IndexError.malformedCache("File size exceeds SQLite integer range") }
+                        if !directory, let wasDirectory: Bool = try Bool.fetchOne(previousDirectory, arguments: [normalized, entry.path]), wasDirectory {
+                            let (lower, upper): (Data, Data) = prefixRange(entry.path)
+                            try db.execute(sql: "DELETE FROM nodes WHERE root=? AND path>=? AND path<?", arguments: [normalized, lower, upper])
+                            try db.execute(sql: "DELETE FROM aliases WHERE root=? AND (path=? OR (path>=? AND path<?) OR target=? OR (target>=? AND target<?))", arguments: [normalized, entry.path, lower, upper, entry.path, lower, upper])
+                            issues.removeAll { $0.path == entry.path || isDescendant($0.path, of: entry.path) }
                         }
-                        try apply(batch)
+                        let parent: Data? = entry.path == Data(normalized.utf8) ? nil : (entry.parentPath ?? parentPath(entry.path))
+                        try upsert.execute(arguments: [normalized, entry.path, parent, entry.name, pathDepth(entry.path), directory, encodeMetadata(entry.metadata), Int64(logical), Int64(entry.metadata.allocatedBytes), Int64(logical), Int64(entry.metadata.allocatedBytes), revision, revision, revision])
+                        if directory { try markDirty.execute(arguments: [entry.path, pathDepth(entry.path)]) }
+                        if let parent { try markDirty.execute(arguments: [parent, pathDepth(parent)]) }
+                        observed += 1
+                        logicalObserved += logical
+                        allocatedObserved += entry.metadata.allocatedBytes
                     }
-                } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
-                    try scanDirectory(parentPath(path))
-                    return
-                } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
-                    let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
-                    issues.removeAll { $0.path == failedPath }
-                    issues.append(issue)
-                    try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
-                    return
+                    receiveEvent(.batch(batch))
+                    receiveEvent(.progress(IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsedSeconds(start), previousNodeCount: cached?.nodeCount)))
                 }
-                metrics = addMetrics(metrics, summary.metrics)
-                issues.removeAll { issue in
-                    issue.path == path || (parentPath(issue.path) == path && [.metadataUnavailable, .vanished].contains(issue.kind))
-                }
-                issues += summary.issues
-                try preserveUnreachable(db: db, root: normalized, issues: summary.issues, revision: revision)
-                let stale: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM nodes INDEXED BY node_children WHERE root=? AND parent=? AND seen<>?", arguments: [normalized, path, revision])
-                for obsolete: Data in stale {
-                    try removeTree(db: db, root: normalized, path: obsolete, revision: revision)
-                    issues.removeAll { $0.path == obsolete || isDescendant($0.path, of: obsolete) }
-                }
-                for child: Data in newDirectories { try scanTree(child) }
-                try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
-            }
-            func reconcile(_ update: JournalReplay) throws {
-                let recursive: [Data] = minimalPaths(try update.recursiveDirectories.map { try resolveAliasPath(db: db, root: normalized, path: Data($0.utf8)) }.filter { path in !exclusions.contains(where: { excludedPath(path, directory: $0) }) })
-                for path: Data in recursive {
-                    if isCancelled() { throw ScanError.cancelled }
-                    var metadata: stat = stat()
-                    let exists: Int32 = path.withUnsafeBytes { bytes in
-                        var terminated: [UInt8] = Array(bytes)
-                        terminated.append(0)
-                        return terminated.withUnsafeBytes { lstat($0.baseAddress!.assumingMemoryBound(to: CChar.self), &metadata) }
-                    }
-                    if exists != 0 && errno == ENOENT {
-                        try removeTree(db: db, root: normalized, path: path, revision: revision)
-                        issues.removeAll { $0.path == path || isDescendant($0.path, of: path) }
-                        try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
-                    } else if exists == 0 && metadata.st_mode & S_IFMT == S_IFDIR {
-                        try scanTree(path)
-                    } else {
-                        let parent: Data = parentPath(path)
-                        try scanDirectory(parent)
-                    }
-                }
-                for directory: String in update.dirtyDirectories {
-                    let path: Data = try resolveAliasPath(db: db, root: normalized, path: Data(directory.utf8))
-                    if !recursive.contains(where: { path == $0 || isDescendant(path, of: $0) }) { try scanDirectory(path) }
-                }
-            }
-            if mode == .full || cached == nil || replay.requiresFullScan || rootChanged {
-                try scanTree(Data(normalized.utf8))
-            } else {
-                issues = cached?.issues ?? []
-                try reconcile(replay)
-                if case .directories(let directories) = mode {
-                    for directory: Data in minimalPaths(directories) {
-                        let path: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
-                        try scanDirectory(path)
-                    }
-                }
-                let retryPaths: [Data] = minimalPaths(issues.filter { [.metadataUnavailable, .ioError, .changedDuringScan, .vanished].contains($0.kind) }.map(\.path))
-                for path: Data in retryPaths {
-                    if try Bool.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path]) == true {
-                        try scanTree(path)
-                    } else {
+                func scanTree(_ path: Data) throws {
+                    try resetSeen(db: db, root: normalized, path: path)
+                    let summary: ScanSummary
+                    do {
+                        summary = try DirectoryScanner.scan(root: path, options: options, isCancelled: isCancelled, receiveBatch: apply)
+                    } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
                         try scanDirectory(parentPath(path))
+                        return
+                    } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
+                        let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
+                        issues.removeAll { $0.path == failedPath }
+                        issues.append(issue)
+                        try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
+                        return
+                    }
+                    metrics = addMetrics(metrics, summary.metrics)
+                    issues.removeAll { $0.path == path || isDescendant($0.path, of: path) }
+                    issues += summary.issues
+                    for alias: ScanAlias in summary.aliases {
+                        try db.execute(sql: "INSERT INTO aliases(root,path,target,seen) VALUES(?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET target=excluded.target,seen=excluded.seen", arguments: [normalized, alias.aliasPath, alias.targetPath, revision])
+                    }
+                    try preserveUnreachable(db: db, root: normalized, issues: summary.issues, revision: revision)
+                    try markRemovedParents(db: db, root: normalized, path: path, revision: revision)
+                    try removeUnseen(db: db, root: normalized, path: path, revision: revision)
+                    try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
+                }
+                func scanDirectory(_ path: Data) throws {
+                    if exclusions.contains(where: { excludedPath(path, directory: $0) }) { return }
+                    let existing: Row? = try Row.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path])
+                    guard existing != nil else { try scanTree(path); return }
+                    try db.execute(sql: "UPDATE nodes SET seen=0 WHERE root=? AND path=?", arguments: [normalized, path])
+                    try db.execute(sql: "UPDATE nodes INDEXED BY node_children SET seen=0 WHERE root=? AND parent=?", arguments: [normalized, path])
+                    var newDirectories: [Data] = []
+                    let summary: ScanSummary
+                    do {
+                        summary = try DirectoryScanner.enumerateDirectory(path: path, options: options, isCancelled: isCancelled) { batch in
+                            for entry: ScanEntry in batch where entry.metadata.kind == .directory && entry.path != path {
+                                let previous: Data? = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, entry.path])
+                                if let previous {
+                                    let metadata: FileMetadata = try decodeMetadata(previous)
+                                    if metadata.kind != .directory || metadata.device != entry.metadata.device || metadata.inode != entry.metadata.inode { newDirectories.append(entry.path) }
+                                } else { newDirectories.append(entry.path) }
+                            }
+                            try apply(batch)
+                        }
+                    } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
+                        try scanDirectory(parentPath(path))
+                        return
+                    } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
+                        let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
+                        issues.removeAll { $0.path == failedPath }
+                        issues.append(issue)
+                        try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
+                        return
+                    }
+                    metrics = addMetrics(metrics, summary.metrics)
+                    issues.removeAll { issue in
+                        issue.path == path || (parentPath(issue.path) == path && [.metadataUnavailable, .vanished].contains(issue.kind))
+                    }
+                    issues += summary.issues
+                    try preserveUnreachable(db: db, root: normalized, issues: summary.issues, revision: revision)
+                    let stale: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM nodes INDEXED BY node_children WHERE root=? AND parent=? AND seen<>?", arguments: [normalized, path, revision])
+                    for obsolete: Data in stale {
+                        try removeTree(db: db, root: normalized, path: obsolete, revision: revision)
+                        issues.removeAll { $0.path == obsolete || isDescendant($0.path, of: obsolete) }
+                    }
+                    for child: Data in newDirectories { try scanTree(child) }
+                    try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
+                }
+                func reconcile(_ update: JournalReplay) throws {
+                    let recursive: [Data] = minimalPaths(try update.recursiveDirectories.map { try resolveAliasPath(db: db, root: normalized, path: Data($0.utf8)) }.filter { path in !exclusions.contains(where: { excludedPath(path, directory: $0) }) })
+                    for path: Data in recursive {
+                        if isCancelled() { throw ScanError.cancelled }
+                        var metadata: stat = stat()
+                        let exists: Int32 = path.withUnsafeBytes { bytes in
+                            var terminated: [UInt8] = Array(bytes)
+                            terminated.append(0)
+                            return terminated.withUnsafeBytes { lstat($0.baseAddress!.assumingMemoryBound(to: CChar.self), &metadata) }
+                        }
+                        if exists != 0 && errno == ENOENT {
+                            try removeTree(db: db, root: normalized, path: path, revision: revision)
+                            issues.removeAll { $0.path == path || isDescendant($0.path, of: path) }
+                            try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
+                        } else if exists == 0 && metadata.st_mode & S_IFMT == S_IFDIR {
+                            try scanTree(path)
+                        } else {
+                            let parent: Data = parentPath(path)
+                            try scanDirectory(parent)
+                        }
+                    }
+                    for directory: String in update.dirtyDirectories {
+                        let path: Data = try resolveAliasPath(db: db, root: normalized, path: Data(directory.utf8))
+                        if !recursive.contains(where: { path == $0 || isDescendant(path, of: $0) }) { try scanDirectory(path) }
                     }
                 }
-            }
-            var settled: Bool = false
-            for _: Int in 0..<8 {
-                let pending: JournalReplay = try journal.drain()
-                currentCheckpoint = pending.checkpoint
-                if pending.requiresFullScan {
+                if mode == .full || cached == nil || replay.requiresFullScan || rootChanged {
                     try scanTree(Data(normalized.utf8))
-                } else if pending.dirtyDirectories.isEmpty && pending.recursiveDirectories.isEmpty {
-                    settled = true
-                    break
                 } else {
-                    try reconcile(pending)
+                    issues = cached?.issues ?? []
+                    try reconcile(replay)
+                    if case .directories(let directories) = mode {
+                        for directory: Data in minimalPaths(directories) {
+                            let path: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
+                            try scanDirectory(path)
+                        }
+                    }
+                    let retryPaths: [Data] = minimalPaths(issues.filter { [.metadataUnavailable, .ioError, .changedDuringScan, .vanished].contains($0.kind) }.map(\.path))
+                    for path: Data in retryPaths {
+                        if try Bool.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path]) == true {
+                            try scanTree(path)
+                        } else {
+                            try scanDirectory(parentPath(path))
+                        }
+                    }
                 }
+                var settled: Bool = false
+                for _: Int in 0..<8 {
+                    let pending: JournalReplay = try journal.drain()
+                    currentCheckpoint = pending.checkpoint
+                    if pending.requiresFullScan {
+                        try scanTree(Data(normalized.utf8))
+                    } else if pending.dirtyDirectories.isEmpty && pending.recursiveDirectories.isEmpty {
+                        settled = true
+                        break
+                    } else {
+                        try reconcile(pending)
+                    }
+                }
+                guard settled else { throw IndexError.unstableFilesystem(normalized) }
+                if isCancelled() { throw ScanError.cancelled }
+                try rebuildAggregates(db: db, root: normalized)
+                guard let row: Row = try Row.fetchOne(db, sql: "SELECT total_logical,total_allocated,total_count FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(normalized.utf8)]) else { throw IndexError.malformedCache("Root node missing after scan") }
+                let blockingIssues: [ScanIssue] = issues.filter { $0.kind != .excluded && $0.kind != .directoryAlias && $0.kind != .mountBoundary }
+                let summary: IndexSummary = IndexSummary(root: normalized, logicalBytes: UInt64(row["total_logical"] as Int64), allocatedBytes: UInt64(row["total_allocated"] as Int64), nodeCount: row["total_count"], revision: revision, lastScanDate: Date(), isComplete: blockingIssues.isEmpty, issues: issues, metrics: metrics)
+                try db.execute(sql: "INSERT INTO roots(root,revision,summary,checkpoint) VALUES(?,?,?,?) ON CONFLICT(root) DO UPDATE SET revision=excluded.revision,summary=excluded.summary,checkpoint=excluded.checkpoint", arguments: [normalized, revision, try JSONEncoder().encode(summary), try currentCheckpoint.map { try JSONEncoder().encode($0) }])
+                return summary
             }
-            guard settled else { throw IndexError.unstableFilesystem(normalized) }
-            if isCancelled() { throw ScanError.cancelled }
-            try rebuildAggregates(db: db, root: normalized)
-            guard let row: Row = try Row.fetchOne(db, sql: "SELECT total_logical,total_allocated,total_count FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(normalized.utf8)]) else { throw IndexError.malformedCache("Root node missing after scan") }
-            let blockingIssues: [ScanIssue] = issues.filter { $0.kind != .excluded && $0.kind != .directoryAlias && $0.kind != .mountBoundary }
-            let summary: IndexSummary = IndexSummary(root: normalized, logicalBytes: UInt64(row["total_logical"] as Int64), allocatedBytes: UInt64(row["total_allocated"] as Int64), nodeCount: row["total_count"], revision: revision, lastScanDate: Date(), isComplete: blockingIssues.isEmpty, issues: issues, metrics: metrics)
-            try db.execute(sql: "INSERT INTO roots(root,revision,summary,checkpoint) VALUES(?,?,?,?) ON CONFLICT(root) DO UPDATE SET revision=excluded.revision,summary=excluded.summary,checkpoint=excluded.checkpoint", arguments: [normalized, revision, try JSONEncoder().encode(summary), try currentCheckpoint.map { try JSONEncoder().encode($0) }])
-            return summary
         }
         receiveEvent(.completed(result))
         return result

@@ -359,6 +359,8 @@ struct IncrementalIndexTests {
             let name: String
             switch event {
             case .started: name = "started"
+            case .waitingForWriter: name = "waiting_for_writer"
+            case .writerAcquired: name = "writer_acquired"
             case .batch: name = "batch"
             case .progress: name = "progress"
             case .completed: name = "completed"
