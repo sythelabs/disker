@@ -8,11 +8,14 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var model: DiskTreeModel
+    @State private var locations: SidebarLocations
+    @State private var sidebarSelection: SidebarSelection?
     @State private var selection: DiskTreeRowID?
     @State private var choosingFolder: Bool = false
     @State private var showingIssues: Bool = false
     @State private var folderPickerError: String?
     @State private var fileOperationError: String?
+    @State private var folderStarError: String?
     @State private var previewURL: URL?
     @State private var renaming: FileItem?
     @State private var choosingApplication: Bool = false
@@ -23,38 +26,46 @@ struct ContentView: View {
 
     init(rootURL: URL, cacheURL: URL) {
         _model = State(initialValue: DiskTreeModel(rootURL: rootURL, cacheURL: cacheURL))
+        _locations = State(initialValue: SidebarLocations(homeURL: FileManager.default.homeDirectoryForCurrentUser, defaults: .standard))
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            tree
-            Divider()
-            TreeScanStatus(model: model, issues: blockingIssues, showingIssues: $showingIssues)
-        }
-        .frame(minWidth: 740, minHeight: 440)
-        .navigationTitle("Disker")
-        .navigationSubtitle(model.rootPath)
-        .toolbar {
-            ToolbarItemGroup {
-                Button("Choose Folder", systemImage: "folder") { choosingFolder = true }
-                    .help("Choose the root of the file tree")
-                    .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
-                        switch result {
-                        case .success(let url):
-                            selection = nil
-                            Task { await model.chooseRoot(url) }
-                        case .failure(let error):
-                            folderPickerError = error.localizedDescription
+        NavigationSplitView {
+            LocationSidebar(locations: locations, selection: sidebarSelectionBinding)
+            .navigationSplitViewColumnWidth(min: 190, ideal: 240, max: 340)
+        } detail: {
+            VStack(spacing: 0) {
+                tree
+                Divider()
+                TreeScanStatus(model: model, issues: blockingIssues, showingIssues: $showingIssues)
+            }
+            .navigationTitle(rootTitle)
+            .navigationSubtitle(model.rootPath)
+            .toolbar {
+                ToolbarItemGroup {
+                    Button("Choose Folder", systemImage: "folder") { choosingFolder = true }
+                        .help("Choose the root of the file tree")
+                        .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
+                            switch result {
+                            case .success(let url): chooseRoot(url)
+                            case .failure(let error): folderPickerError = error.localizedDescription
+                            }
                         }
+                    Button(locations.isStarred(rootURL) ? "Unstar Folder" : "Star Folder", systemImage: locations.isStarred(rootURL) ? "star.fill" : "star") {
+                        toggleStar(rootURL)
                     }
-                if model.isScanning {
-                    Button("Stop Scan", systemImage: "stop.fill") { model.cancelScan() }
-                } else {
-                    Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
-                        .keyboardShortcut("r", modifiers: .command)
+                    .help("Keep this folder in the sidebar")
+                    if model.isScanning {
+                        Button("Stop Scan", systemImage: "stop.fill") { model.cancelScan() }
+                    } else {
+                        Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
+                            .keyboardShortcut("r", modifiers: .command)
+                    }
                 }
             }
         }
+        .navigationSplitViewStyle(.balanced)
+        .frame(minWidth: 940, minHeight: 440)
         .alert("Could not choose folder", isPresented: Binding(get: { folderPickerError != nil }, set: { if !$0 { folderPickerError = nil } })) {
             Button("OK", role: .cancel) { folderPickerError = nil }
         } message: { Text(folderPickerError ?? "") }
@@ -73,6 +84,9 @@ struct ContentView: View {
         .alert("File operation failed", isPresented: Binding(get: { fileOperationError != nil }, set: { if !$0 { fileOperationError = nil } })) {
             Button("OK", role: .cancel) { fileOperationError = nil }
         } message: { Text(fileOperationError ?? "") }
+        .alert("Could not star folder", isPresented: Binding(get: { folderStarError != nil }, set: { if !$0 { folderStarError = nil } })) {
+            Button("OK", role: .cancel) { folderStarError = nil }
+        } message: { Text(folderStarError ?? "") }
         .quickLookPreview($previewURL)
         .sheet(item: $renaming) { item in
             RenameItemSheet(item: item) { name in
@@ -89,6 +103,11 @@ struct ContentView: View {
             do { clipboardItems = try operations.files(on: .general) }
             catch { fileOperationError = error.localizedDescription }
             await model.start()
+        }
+        .task { await locations.load() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)
+            .merge(with: NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification))) { _ in
+            Task { await locations.load() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             do { clipboardItems = try operations.files(on: .general) }
@@ -188,6 +207,42 @@ struct ContentView: View {
         model.summary?.issues.filter { ![.excluded, .directoryAlias, .mountBoundary].contains($0.kind) } ?? []
     }
 
+    private var rootURL: URL { URL(fileURLWithPath: model.rootPath) }
+
+    private var rootTitle: String { model.rootPath == "/" ? "File System" : rootURL.lastPathComponent }
+
+    private var sidebarSelectionBinding: Binding<SidebarSelection?> {
+        Binding(
+            get: {
+                let destinations: [SidebarSelection] = locations.favorites.map { SidebarSelection(section: .favorites, path: $0.id) }
+                    + locations.starred.map { SidebarSelection(section: .starred, path: $0.id) }
+                    + locations.local.map { SidebarSelection(section: .local, path: $0.id) }
+                    + locations.network.map { SidebarSelection(section: .network, path: $0.id) }
+                if let sidebarSelection, sidebarSelection.path == model.rootPath, destinations.contains(sidebarSelection) { return sidebarSelection }
+                return destinations.first { $0.path == model.rootPath }
+            },
+            set: { destination in
+                sidebarSelection = destination
+                if let destination, destination.path != model.rootPath { chooseRoot(URL(fileURLWithPath: destination.path)) }
+            }
+        )
+    }
+
+    private func chooseRoot(_ url: URL) {
+        selection = nil
+        Task { await model.chooseRoot(url) }
+    }
+
+    private func toggleStar(_ url: URL) {
+        if locations.isStarred(url) { locations.unstar(url) }
+        else {
+            Task {
+                do { try await locations.star(url) }
+                catch { folderStarError = error.localizedDescription }
+            }
+        }
+    }
+
     private func node(in ids: Set<DiskTreeRowID>) -> IndexedNode? {
         guard let id: DiskTreeRowID = ids.first else { return nil }
         return model.rows.first { $0.id == id }?.node
@@ -211,6 +266,9 @@ struct ContentView: View {
             }
         } else {
             Button(model.expanded.contains(item.id) ? "Collapse Folder" : "Expand Folder") { Task { await model.toggle(item.id) } }
+            Button(locations.isStarred(item.url) ? "Unstar Folder" : "Star Folder", systemImage: locations.isStarred(item.url) ? "star.fill" : "star") {
+                toggleStar(item.url)
+            }
         }
         Button("Quick Look", systemImage: "eye") { previewURL = item.url }
             .keyboardShortcut(.space, modifiers: [])

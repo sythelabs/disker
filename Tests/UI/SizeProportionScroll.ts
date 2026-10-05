@@ -6,8 +6,11 @@ interface SizeProportionApp {
 
 export async function verifySizeProportionScroll(app: SizeProportionApp): Promise<number> {
     const initial: string = await app.getAXState({ emit: false, disableDiffing: true });
-    const scrollArea: RegExpMatchArray | null = initial.match(/^\s*([0-9]+) scroll area/m);
-    if (scrollArea === null) throw new Error("Disker file table scroll area was not found");
+    const firstBar: number = initial.indexOf("Share of parent folder");
+    if (firstBar < 0) throw new Error("Disker file table size bars were not found");
+    const scrollAreas: RegExpMatchArray[] = Array.from(initial.slice(0, firstBar).matchAll(/^\s*([0-9]+) scroll area/gm));
+    const scrollArea: RegExpMatchArray | undefined = scrollAreas.pop();
+    if (scrollArea === undefined) throw new Error("Disker file table scroll area was not found");
     const target: number = Number(scrollArea[1]);
     await app.scroll(target, "down", 2);
     await app.scroll(target, "up", 2);
