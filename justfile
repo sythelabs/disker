@@ -29,7 +29,7 @@ full-disk-access: build
     @printf '%s\n' 'Drag Disker.app from Finder into Full Disk Access and enable it. Quit Disker, then run just run.'
 
 test:
-    swift test
+    swift test --no-parallel
 
 index *args:
     swift run disker-index "$@"
