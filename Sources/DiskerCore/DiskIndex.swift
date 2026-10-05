@@ -138,6 +138,12 @@ public actor DiskIndex {
 
     public func refresh(root: String, mode: RefreshMode, receiveEvent: @escaping @Sendable (IndexEvent) -> Void, isCancelled: @escaping @Sendable () -> Bool) async throws -> IndexSummary {
         let normalized: String = normalizedRoot(root)
+        if case .directories(let directories) = mode {
+            let rootPath: Data = Data(normalized.utf8)
+            guard directories.allSatisfy({ $0 == rootPath || isDescendant($0, of: rootPath) }) else {
+                throw IndexError.invalidQuery("Changed directories must be inside the indexed root: \(normalized)")
+            }
+        }
         let cachedAtStart: IndexSummary? = try await cachedSummary(root: normalized)
         receiveEvent(.started(cached: cachedAtStart))
         if isCancelled() { throw ScanError.cancelled }
@@ -307,6 +313,12 @@ public actor DiskIndex {
             } else {
                 issues = cached?.issues ?? []
                 try reconcile(replay)
+                if case .directories(let directories) = mode {
+                    for directory: Data in minimalPaths(directories) {
+                        let path: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
+                        try scanDirectory(path)
+                    }
+                }
                 let retryPaths: [Data] = minimalPaths(issues.filter { [.metadataUnavailable, .ioError, .changedDuringScan, .vanished].contains($0.kind) }.map(\.path))
                 for path: Data in retryPaths {
                     if try Bool.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path]) == true {

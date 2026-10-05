@@ -1,5 +1,8 @@
+import AppKit
+import Combine
 import DiskerCore
 import Foundation
+import QuickLook
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -9,6 +12,14 @@ struct ContentView: View {
     @State private var choosingFolder: Bool = false
     @State private var showingIssues: Bool = false
     @State private var folderPickerError: String?
+    @State private var fileOperationError: String?
+    @State private var previewURL: URL?
+    @State private var renaming: FileItem?
+    @State private var choosingApplication: Bool = false
+    @State private var applicationItem: FileItem?
+    @State private var operating: Bool = false
+    @State private var clipboardItems: [URL] = []
+    private let operations: FileOperations = FileOperations()
 
     init(rootURL: URL, cacheURL: URL) {
         _model = State(initialValue: DiskTreeModel(rootURL: rootURL, cacheURL: cacheURL))
@@ -47,12 +58,42 @@ struct ContentView: View {
         .alert("Could not choose folder", isPresented: Binding(get: { folderPickerError != nil }, set: { if !$0 { folderPickerError = nil } })) {
             Button("OK", role: .cancel) { folderPickerError = nil }
         } message: { Text(folderPickerError ?? "") }
+        .fileImporter(isPresented: $choosingApplication, allowedContentTypes: [.applicationBundle]) { result in
+            switch result {
+            case .success(let application):
+                if let item: FileItem = applicationItem {
+                    Task {
+                        do { try await operations.open(item, with: application) }
+                        catch { fileOperationError = error.localizedDescription }
+                    }
+                }
+            case .failure(let error): fileOperationError = error.localizedDescription
+            }
+        }
+        .alert("File operation failed", isPresented: Binding(get: { fileOperationError != nil }, set: { if !$0 { fileOperationError = nil } })) {
+            Button("OK", role: .cancel) { fileOperationError = nil }
+        } message: { Text(fileOperationError ?? "") }
+        .quickLookPreview($previewURL)
+        .sheet(item: $renaming) { item in
+            RenameItemSheet(item: item) { name in
+                renaming = nil
+                rename(item, to: name)
+            }
+        }
         .alert("Some locations could not be read", isPresented: $showingIssues) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(blockingIssues.prefix(20).map { "\(String(decoding: $0.path, as: UTF8.self)): \($0.operation), error \($0.errnoCode)" }.joined(separator: "\n"))
         }
-        .task { await model.start() }
+        .task {
+            do { clipboardItems = try operations.files(on: .general) }
+            catch { fileOperationError = error.localizedDescription }
+            await model.start()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            do { clipboardItems = try operations.files(on: .general) }
+            catch { fileOperationError = error.localizedDescription }
+        }
         .onDisappear { model.cancelScan() }
     }
 
@@ -99,12 +140,20 @@ struct ContentView: View {
         .contextMenu(forSelectionType: DiskTreeRowID.self) { ids in
             if case .more(let path) = ids.first {
                 Button("Load more items") { Task { await model.loadMore(path) } }
-            } else if let path: Data = directory(in: ids) {
-                Button(model.expanded.contains(path) ? "Collapse Folder" : "Expand Folder") { Task { await model.toggle(path) } }
+            } else if let node: IndexedNode = node(in: ids) {
+                switch Result(catching: { try FileItem(entry: node.entry) }) {
+                case .success(let item): fileMenu(item)
+                case .failure(let error): Button("Could not access item") { fileOperationError = error.localizedDescription }
+                }
+            } else {
+                pasteMenu(into: URL(fileURLWithPath: model.rootPath))
             }
         } primaryAction: { ids in
             if case .more(let path) = ids.first { Task { await model.loadMore(path) } }
-            else if let path: Data = directory(in: ids) { Task { await model.toggle(path) } }
+            else if let node: IndexedNode = node(in: ids) {
+                do { open(try FileItem(entry: node.entry)) }
+                catch { fileOperationError = error.localizedDescription }
+            }
         }
         .onKeyPress(.rightArrow) {
             guard case .node(let path) = selection,
@@ -123,6 +172,7 @@ struct ContentView: View {
             else { return .ignored }
             return .handled
         }
+        .onKeyPress(phases: .down, action: handleFileKeyPress)
         .overlay {
             if model.rows.isEmpty {
                 if model.isScanning {
@@ -138,10 +188,209 @@ struct ContentView: View {
         model.summary?.issues.filter { ![.excluded, .directoryAlias, .mountBoundary].contains($0.kind) } ?? []
     }
 
-    private func directory(in ids: Set<DiskTreeRowID>) -> Data? {
-        guard let id: DiskTreeRowID = ids.first, let row: DiskTreeRow = model.rows.first(where: { $0.id == id }),
-              let node: IndexedNode = row.node, node.entry.metadata.kind == .directory else { return nil }
-        return node.entry.path
+    private func node(in ids: Set<DiskTreeRowID>) -> IndexedNode? {
+        guard let id: DiskTreeRowID = ids.first else { return nil }
+        return model.rows.first { $0.id == id }?.node
+    }
+
+    @ViewBuilder private func fileMenu(_ item: FileItem) -> some View {
+        Button("Open", systemImage: "arrow.up.forward.app") { open(item) }
+            .keyboardShortcut("o", modifiers: .command)
+        if !item.isDirectory {
+            Menu("Open With") {
+                ForEach(operations.applications(for: item), id: \.self) { application in
+                    Button(FileManager.default.displayName(atPath: application.path)) {
+                        Task {
+                            do { try await operations.open(item, with: application) }
+                            catch { fileOperationError = error.localizedDescription }
+                        }
+                    }
+                }
+                Divider()
+                Button("Other Application") { applicationItem = item; choosingApplication = true }
+            }
+        } else {
+            Button(model.expanded.contains(item.id) ? "Collapse Folder" : "Expand Folder") { Task { await model.toggle(item.id) } }
+        }
+        Button("Quick Look", systemImage: "eye") { previewURL = item.url }
+            .keyboardShortcut(.space, modifiers: [])
+        Button("Reveal in Finder", systemImage: "folder") { operations.reveal(item) }
+        Divider()
+        Button("Rename") { renaming = item }.disabled(operating)
+        Button("Duplicate") { duplicate(item) }.keyboardShortcut("d", modifiers: .command).disabled(operating)
+        Button("Copy") { copy(item) }.keyboardShortcut("c", modifiers: .command)
+        Button("Copy Path") { copyPath(item) }.keyboardShortcut("c", modifiers: [.command, .option])
+        pasteMenu(into: item.isDirectory ? item.url : item.url.deletingLastPathComponent())
+        ShareLink("Share", item: item.url)
+        Divider()
+        Button("Move to Trash", systemImage: "trash", role: .destructive) { trash(item) }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(operating)
+    }
+
+    @ViewBuilder private func pasteMenu(into directory: URL) -> some View {
+        Button("Paste Item") { paste(into: directory) }
+            .keyboardShortcut("v", modifiers: .command)
+            .disabled(operating || clipboardItems.isEmpty)
+        Button("Move Item Here") { move(into: directory) }
+            .keyboardShortcut("v", modifiers: [.command, .option])
+            .disabled(operating || clipboardItems.isEmpty)
+    }
+
+    private func open(_ item: FileItem) {
+        Task {
+            do {
+                if item.isDirectory {
+                    guard String(data: item.id, encoding: .utf8) != nil else { throw FileOperationError.pathNotUTF8(item.url) }
+                    selection = nil
+                    await model.chooseRoot(item.url)
+                } else { try await operations.open(item) }
+            } catch { fileOperationError = error.localizedDescription }
+        }
+    }
+
+    private func copy(_ item: FileItem) {
+        do {
+            try operations.copy(item, to: .general)
+            clipboardItems = try operations.files(on: .general)
+        } catch { fileOperationError = error.localizedDescription }
+    }
+
+    private func copyPath(_ item: FileItem) {
+        do {
+            try operations.copyPath(item, to: .general)
+            clipboardItems = try operations.files(on: .general)
+        } catch { fileOperationError = error.localizedDescription }
+    }
+
+    private func rename(_ item: FileItem, to name: String) {
+        performMutation(in: [item.url.deletingLastPathComponent()]) {
+            let destination: URL = try await operations.rename(item, to: name)
+            return FileChange(removedURL: item.url, insertedURL: destination)
+        }
+    }
+
+    private func duplicate(_ item: FileItem) {
+        performMutation(in: [item.url.deletingLastPathComponent()]) {
+            let destination: URL = try await operations.duplicate(item)
+            return FileChange(removedURL: nil, insertedURL: destination)
+        }
+    }
+
+    private func trash(_ item: FileItem) {
+        performMutation(in: [item.url.deletingLastPathComponent()]) {
+            _ = try await operations.trash(item)
+            return FileChange(removedURL: item.url, insertedURL: nil)
+        }
+    }
+
+    private func paste(into directory: URL) {
+        let sources: [URL]
+        do { sources = try operations.files(on: .general) }
+        catch { fileOperationError = error.localizedDescription; return }
+        performMutation(in: [directory]) {
+            var destination: URL?
+            guard !sources.isEmpty else { throw FileOperationError.failed("Paste", directory, "No files on the clipboard") }
+            for source: URL in sources { destination = try await operations.paste(source, into: directory) }
+            return FileChange(removedURL: nil, insertedURL: destination)
+        }
+    }
+
+    private func move(into directory: URL) {
+        let sources: [URL]
+        do { sources = try operations.files(on: .general) }
+        catch { fileOperationError = error.localizedDescription; return }
+        performMutation(in: sources.map { $0.deletingLastPathComponent() } + [directory]) {
+            var destination: URL?
+            guard !sources.isEmpty else { throw FileOperationError.failed("Move", directory, "No files on the clipboard") }
+            for source: URL in sources { destination = try await operations.move(source, into: directory) }
+            return FileChange(removedURL: sources.last, insertedURL: destination)
+        }
+    }
+
+    private func performMutation(in directories: [URL], operation: @escaping @MainActor () async throws -> FileChange) {
+        guard !operating else { return }
+        operating = true
+        let originalRoot: String = model.rootPath
+        let originalSelection: DiskTreeRowID? = selection
+        Task {
+            defer { operating = false }
+            var change: FileChange?
+            do { change = try await operation() }
+            catch { fileOperationError = error.localizedDescription }
+            do {
+                let root: Data = Data(model.rootPath.utf8)
+                if let removed: URL = change?.removedURL, try filePathBytes(removed) == root {
+                    selection = nil
+                    await model.chooseRoot(change?.insertedURL ?? removed.deletingLastPathComponent())
+                } else {
+                    let prefix: Data = root.last == 47 ? root : root + Data([47])
+                    let paths: [Data] = try directories.map(filePathBytes).filter { $0 == root || $0.starts(with: prefix) }
+                    if !paths.isEmpty { await model.refreshDirectories(paths) }
+                    if model.rootPath == originalRoot, selection == originalSelection {
+                        if let inserted: URL = change?.insertedURL {
+                            let id: DiskTreeRowID = .node(try filePathBytes(inserted))
+                            if model.rows.contains(where: { $0.id == id }) { selection = id }
+                        } else if let removed: URL = change?.removedURL, selection == .node(try filePathBytes(removed)) { selection = nil }
+                    }
+                }
+            } catch { fileOperationError = error.localizedDescription }
+        }
+    }
+
+    private func handleFileKeyPress(_ press: KeyPress) -> KeyPress.Result {
+        do {
+            let item: FileItem? = try selection.flatMap { id in
+                guard let entry: ScanEntry = node(in: [id])?.entry else { return nil }
+                return try FileItem(entry: entry)
+            }
+            let destination: URL = item.map { $0.isDirectory ? $0.url : $0.url.deletingLastPathComponent() } ?? URL(fileURLWithPath: model.rootPath)
+            if press.key == "v", press.modifiers == .command, !operating, !clipboardItems.isEmpty { paste(into: destination); return .handled }
+            if press.key == "v", press.modifiers == [.command, .option], !operating, !clipboardItems.isEmpty { move(into: destination); return .handled }
+            guard let item else { return .ignored }
+            if press.key == "o", press.modifiers == .command { open(item); return .handled }
+            if press.key == .space, press.modifiers.isEmpty { previewURL = item.url; return .handled }
+            if press.key == "c", press.modifiers == .command { copy(item); return .handled }
+            if press.key == "c", press.modifiers == [.command, .option] { copyPath(item); return .handled }
+            if press.key == .return, press.modifiers.isEmpty, !operating { renaming = item; return .handled }
+            if press.key == "d", press.modifiers == .command, !operating { duplicate(item); return .handled }
+            // macOS Delete sends DEL (0x7f), while SwiftUI's .delete represents backspace (0x08).
+            if (press.key == .delete || press.key == KeyEquivalent("\u{7f}")), press.modifiers == .command, !operating { trash(item); return .handled }
+            return .ignored
+        } catch {
+            fileOperationError = error.localizedDescription
+            return .handled
+        }
+    }
+}
+
+private struct RenameItemSheet: View {
+    let item: FileItem
+    let rename: (String) -> Void
+    @State private var name: String
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focused: Bool
+
+    init(item: FileItem, rename: @escaping (String) -> Void) {
+        self.item = item
+        self.rename = rename
+        _name = State(initialValue: item.name)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename \(item.name)").font(.headline)
+            TextField("Name", text: $name).focused($focused)
+                .onSubmit { if !name.isEmpty, name != item.name { rename(name) } }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                Button("Rename") { rename(name) }.keyboardShortcut(.defaultAction).disabled(name.isEmpty || name == item.name)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+        .onAppear { focused = true }
     }
 }
 

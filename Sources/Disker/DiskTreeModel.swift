@@ -127,6 +127,19 @@ final class DiskTreeModel {
     }
 
     func refresh() {
+        beginScan(mode: .automatic)
+    }
+
+    func refreshDirectories(_ directories: [Data]) async {
+        let ticket: UInt64 = generation
+        cancelScan()
+        await scanTask?.value
+        guard ticket == generation else { return }
+        beginScan(mode: .directories(directories))
+        await scanTask?.value
+    }
+
+    private func beginScan(mode: RefreshMode) {
         guard let index, !isScanning else { return }
         generation += 1
         let ticket: UInt64 = generation
@@ -146,7 +159,7 @@ final class DiskTreeModel {
             }
             defer { polling.cancel() }
             do {
-                _ = try await index.refresh(root: root, mode: .automatic, receiveEvent: { buffer.receive($0) }, isCancelled: { buffer.isCancelled })
+                _ = try await index.refresh(root: root, mode: mode, receiveEvent: { buffer.receive($0) }, isCancelled: { buffer.isCancelled })
                 guard ticket == generation else { return }
                 try await reloadSnapshot(ticket: ticket)
             } catch ScanError.cancelled {

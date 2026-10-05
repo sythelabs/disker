@@ -1,8 +1,9 @@
 import Foundation
 
-public enum RefreshMode: Sendable {
+public enum RefreshMode: Equatable, Sendable {
     case automatic
     case full
+    case directories([Data])
 }
 
 public struct IndexedNode: Codable, Equatable, Sendable {

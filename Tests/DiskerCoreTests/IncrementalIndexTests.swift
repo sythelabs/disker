@@ -94,6 +94,41 @@ private func waitForIncrementalSignal(_ semaphore: DispatchSemaphore, timeout: D
 
 @Suite("Incremental index", .serialized)
 struct IncrementalIndexTests {
+    @Test func explicitDirectoriesImmediatelyReconcileFileOperationsWithoutWalkingUntouchedBranches() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let edited: URL = fixture.root.appendingPathComponent("edited")
+        let untouched: URL = fixture.root.appendingPathComponent("untouched")
+        try createIncrementalFiles(directory: edited, count: 2, bytes: 3)
+        try createIncrementalFiles(directory: untouched, count: 600, bytes: 1)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        try FileManager.default.moveItem(at: edited.appendingPathComponent("file-0"), to: edited.appendingPathComponent("renamed"))
+        try FileManager.default.removeItem(at: edited.appendingPathComponent("file-1"))
+        try Data(repeating: 1, count: 7).write(to: edited.appendingPathComponent("added"))
+        let observed: Mutex<[Data]> = Mutex([])
+        let updated: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .directories([Data(edited.path.utf8)]), receiveEvent: { event in
+            if case .batch(let entries) = event { observed.withLock { $0.append(contentsOf: entries.map(\.path)) } }
+        }, isCancelled: { false })
+        #expect(updated.logicalBytes == 610)
+        #expect(try await index.node(root: fixture.root.path, path: Data(edited.appendingPathComponent("file-0").path.utf8)) == nil)
+        #expect(try await index.node(root: fixture.root.path, path: Data(edited.appendingPathComponent("file-1").path.utf8)) == nil)
+        #expect(try await index.node(root: fixture.root.path, path: Data(edited.appendingPathComponent("renamed").path.utf8)) != nil)
+        #expect(try await index.node(root: fixture.root.path, path: Data(edited.appendingPathComponent("added").path.utf8)) != nil)
+        #expect(!observed.withLock { $0 }.contains { $0.starts(with: Data((untouched.path + "/").utf8)) })
+    }
+
+    @Test func explicitDirectoryRefreshRejectsPathsOutsideItsRoot() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        await #expect(throws: IndexError.self) {
+            try await index.refresh(root: fixture.root.path, mode: .directories([Data(fixture.container.path.utf8)]), receiveEvent: { _ in }, isCancelled: { false })
+        }
+        #expect(try await index.cachedSummary(root: fixture.root.path) == nil)
+    }
+
     @Test func cacheDirectoryRemainsExcludedWhenDatabaseUsesAnotherFilesystemPath() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }

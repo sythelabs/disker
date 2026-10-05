@@ -63,6 +63,27 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
 
 @Suite("Disk tree model", .serialized)
 @MainActor struct DiskTreeModelTests {
+    @Test func fileOperationRefreshUpdatesExpandedBranchesImmediately() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let folder: URL = fixture.root.appendingPathComponent("folder")
+        try treeFiles(directory: folder, count: 1, bytes: 4_096)
+        _ = try await cachedTree(fixture: fixture)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        await model.start()
+        try await waitForTreeScan(model)
+        await model.toggle(Data(folder.path.utf8))
+        let old: URL = folder.appendingPathComponent("file-0")
+        let renamed: URL = folder.appendingPathComponent("renamed")
+        try FileManager.default.moveItem(at: old, to: renamed)
+        await model.refreshDirectories([Data(folder.path.utf8)])
+        #expect(!model.isScanning)
+        #expect(model.errorMessage == nil)
+        #expect(!model.rows.contains { $0.id == .node(Data(old.path.utf8)) })
+        #expect(model.rows.contains { $0.id == .node(Data(renamed.path.utf8)) })
+        #expect(model.expanded.contains(Data(folder.path.utf8)))
+    }
+
     @Test func repeatedPreviewScopeDoesNotCountFilesTwice() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
