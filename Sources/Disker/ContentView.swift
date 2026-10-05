@@ -38,21 +38,21 @@ struct ContentView: View {
             ToolbarItemGroup {
                 Button("Choose Folder", systemImage: "folder") { choosingFolder = true }
                     .help("Choose the root of the file tree")
+                    .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
+                        switch result {
+                        case .success(let url):
+                            selection = nil
+                            Task { await model.chooseRoot(url) }
+                        case .failure(let error):
+                            folderPickerError = error.localizedDescription
+                        }
+                    }
                 if model.isScanning {
                     Button("Stop Scan", systemImage: "stop.fill") { model.cancelScan() }
                 } else {
                     Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
                         .keyboardShortcut("r", modifiers: .command)
                 }
-            }
-        }
-        .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
-            switch result {
-            case .success(let url):
-                selection = nil
-                Task { await model.chooseRoot(url) }
-            case .failure(let error):
-                folderPickerError = error.localizedDescription
             }
         }
         .alert("Could not choose folder", isPresented: Binding(get: { folderPickerError != nil }, set: { if !$0 { folderPickerError = nil } })) {
