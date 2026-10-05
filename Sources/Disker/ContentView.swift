@@ -64,10 +64,7 @@ struct ContentView: View {
             .width(min: CGFloat((model.rows.map(\.depth).max() ?? 0) * 16 + 300), ideal: 440, max: .infinity)
             TableColumn("Size proportion") { row in
                 if let proportion: Double = row.proportion {
-                    ProgressView(value: proportion, total: 1)
-                        .progressViewStyle(.linear)
-                        .accessibilityLabel("Share of parent folder")
-                        .accessibilityValue(proportion.formatted(.percent.precision(.fractionLength(1))))
+                    SizeProportionBar(proportion: proportion)
                 }
             }
             .width(min: 150, ideal: 180, max: 300)
@@ -145,6 +142,22 @@ struct ContentView: View {
         guard let id: DiskTreeRowID = ids.first, let row: DiskTreeRow = model.rows.first(where: { $0.id == id }),
               let node: IndexedNode = row.node, node.entry.metadata.kind == .directory else { return nil }
         return node.entry.path
+    }
+}
+
+struct SizeProportionBar: View {
+    let proportion: Double
+
+    var body: some View {
+        Gauge(value: proportion, in: ClosedRange<Double>(uncheckedBounds: (lower: 0, upper: 1))) { EmptyView() }
+            .gaugeStyle(.linearCapacity)
+            .tint(.accentColor)
+            .accessibilityLabel("Share of parent folder")
+            .accessibilityValue(proportion.formatted(.percent.precision(.fractionLength(1))))
+            .transaction { transaction in
+                transaction.animation = nil
+                transaction.disablesAnimations = true
+            }
     }
 }
 
