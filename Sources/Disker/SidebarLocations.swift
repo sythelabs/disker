@@ -29,7 +29,7 @@ enum SidebarLocationError: Error, LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .notFolder(let path): return "Only folders can be starred. Select a folder instead of " + path
+        case .notFolder(let path): return "Only folders can be added to Favorites. Select a folder instead of " + path
         case .folderUnavailable(let path, let reason): return "Could not access the folder at " + path + ": " + reason
         case .mountedVolumesUnavailable: return "Could not enumerate mounted volumes."
         case .volumeMetadataUnavailable(let path): return "Could not classify the mounted volume at " + path
@@ -89,18 +89,17 @@ final class SidebarLocations {
     private(set) var favorites: [SidebarLocation]
     private(set) var local: [SidebarLocation]
     private(set) var network: [SidebarLocation] = []
-    private(set) var starred: [SidebarLocation]
     private(set) var errorMessage: String?
     @ObservationIgnored private let homeURL: URL
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var loadGeneration: UInt64 = 0
-    private static let starredDefaultsKey: String = "sidebar.starredFolders"
+    private static let favoritesDefaultsKey: String = "sidebar.favoriteFolders"
 
     init(homeURL: URL, defaults: UserDefaults) {
         let home: URL = normalizedSidebarURL(homeURL)
         self.homeURL = home
         self.defaults = defaults
-        favorites = [
+        let initialFavorites: [SidebarLocation] = [
             SidebarLocation(url: home.appendingPathComponent("Desktop", isDirectory: true), title: "Desktop", systemImage: "desktopcomputer"),
             SidebarLocation(url: home.appendingPathComponent("Documents", isDirectory: true), title: "Documents", systemImage: "doc"),
             SidebarLocation(url: home.appendingPathComponent("Downloads", isDirectory: true), title: "Downloads", systemImage: "arrow.down.circle"),
@@ -108,11 +107,18 @@ final class SidebarLocations {
             SidebarLocation(url: URL(fileURLWithPath: "/Applications", isDirectory: true), title: "Applications", systemImage: "app.dashed")
         ]
         local = [SidebarLocation(url: home, title: home.lastPathComponent, systemImage: "house")]
+        let standardLocations: [String: SidebarLocation] = Dictionary(uniqueKeysWithValues: initialFavorites.map { ($0.id, $0) })
+        let paths: [String]
+        if let saved: [String] = defaults.stringArray(forKey: Self.favoritesDefaultsKey) {
+            paths = saved
+        } else {
+            paths = initialFavorites.map(\.id) + (defaults.stringArray(forKey: "sidebar.starredFolders") ?? [])
+        }
         var seen: Set<String> = []
-        starred = (defaults.stringArray(forKey: Self.starredDefaultsKey) ?? []).compactMap { path in
+        favorites = paths.compactMap { path in
             let url: URL = normalizedSidebarURL(URL(fileURLWithPath: path, isDirectory: true))
             guard seen.insert(url.path).inserted else { return nil }
-            return SidebarLocation(url: url, title: url.lastPathComponent, systemImage: "folder")
+            return standardLocations[url.path] ?? SidebarLocation(url: url, title: url.path == "/" ? "File System" : url.lastPathComponent, systemImage: "folder")
         }
     }
 
@@ -131,23 +137,33 @@ final class SidebarLocations {
         }
     }
 
-    func star(_ url: URL) async throws {
-        let folder: URL = normalizedSidebarURL(url)
-        if isStarred(folder) { return }
-        try await Task.detached(priority: .utility) { try validateSidebarFolder(folder) }.value
-        if isStarred(folder) { return }
-        starred.append(SidebarLocation(url: folder, title: folder.lastPathComponent, systemImage: "folder"))
-        defaults.set(starred.map(\.id), forKey: Self.starredDefaultsKey)
+    func addFavorites(_ urls: [URL], at index: Int) async throws {
+        var seen: Set<String> = Set(favorites.map(\.id))
+        let folders: [URL] = try urls.compactMap { url in
+            guard String(data: try filePathBytes(url), encoding: .utf8) != nil else { throw FileOperationError.pathNotUTF8(url) }
+            let folder: URL = normalizedSidebarURL(url)
+            guard seen.insert(folder.path).inserted else { return nil }
+            return folder
+        }
+        guard !folders.isEmpty else { return }
+        try await Task.detached(priority: .utility) {
+            for folder in folders { try validateSidebarFolder(folder) }
+        }.value
+        let additions: [SidebarLocation] = folders.filter { !isFavorite($0) }.map { folder in
+            SidebarLocation(url: folder, title: folder.path == "/" ? "File System" : folder.lastPathComponent, systemImage: "folder")
+        }
+        favorites.insert(contentsOf: additions, at: min(max(index, 0), favorites.count))
+        defaults.set(favorites.map(\.id), forKey: Self.favoritesDefaultsKey)
     }
 
-    func unstar(_ url: URL) {
+    func removeFavorite(_ url: URL) {
         let id: String = normalizedSidebarURL(url).path
-        starred.removeAll { $0.id == id }
-        defaults.set(starred.map(\.id), forKey: Self.starredDefaultsKey)
+        favorites.removeAll { $0.id == id }
+        defaults.set(favorites.map(\.id), forKey: Self.favoritesDefaultsKey)
     }
 
-    func isStarred(_ url: URL) -> Bool {
+    func isFavorite(_ url: URL) -> Bool {
         let id: String = normalizedSidebarURL(url).path
-        return starred.contains { $0.id == id }
+        return favorites.contains { $0.id == id }
     }
 }

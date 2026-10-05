@@ -26,46 +26,46 @@ private func removeSidebarFixture(_ fixture: SidebarFixture) {
 
 @Suite("Sidebar locations")
 @MainActor struct SidebarLocationsTests {
-    @Test func folderStarsPersistWithoutTouchingUnavailableFolders() async throws {
+    @Test func favoritesPersistWithoutTouchingUnavailableFolders() async throws {
         let fixture: SidebarFixture = try sidebarFixture()
         defer { removeSidebarFixture(fixture) }
         let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
-        try await model.star(fixture.folder)
+        try await model.addFavorites([fixture.folder], at: model.favorites.count)
         try FileManager.default.removeItem(at: fixture.folder)
         let restored: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
-        #expect(restored.starred.count == 1)
-        #expect(restored.starred.first?.url.path == fixture.folder.path)
-        #expect(restored.isStarred(fixture.folder))
+        #expect(restored.favorites.count == 6)
+        #expect(restored.favorites.last?.url.path == fixture.folder.path)
+        #expect(restored.isFavorite(fixture.folder))
     }
 
-    @Test func equivalentURLSpellingsProduceOneStar() async throws {
+    @Test func equivalentURLSpellingsProduceOneFavorite() async throws {
         let fixture: SidebarFixture = try sidebarFixture()
         defer { removeSidebarFixture(fixture) }
         let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
         let dotted: URL = fixture.folder.appendingPathComponent("..").appendingPathComponent("folder")
-        try await model.star(dotted)
-        try await model.star(URL(fileURLWithPath: fixture.folder.path, isDirectory: false))
-        #expect(model.starred.count == 1)
-        #expect(model.isStarred(fixture.folder))
+        try await model.addFavorites([dotted], at: model.favorites.count)
+        try await model.addFavorites([URL(fileURLWithPath: fixture.folder.path, isDirectory: false)], at: model.favorites.count)
+        #expect(model.favorites.count == 6)
+        #expect(model.isFavorite(fixture.folder))
     }
 
-    @Test func removingAStarUpdatesPersistedState() async throws {
+    @Test func removingAFavoriteUpdatesPersistedState() async throws {
         let fixture: SidebarFixture = try sidebarFixture()
         defer { removeSidebarFixture(fixture) }
         let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
-        try await model.star(fixture.folder)
-        model.unstar(fixture.folder)
-        #expect(!model.isStarred(fixture.folder))
-        #expect(SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults).starred.isEmpty)
+        try await model.addFavorites([fixture.folder], at: model.favorites.count)
+        model.removeFavorite(fixture.folder)
+        #expect(!model.isFavorite(fixture.folder))
+        #expect(!SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults).isFavorite(fixture.folder))
     }
 
-    @Test func ordinaryFoldersAreStarredWithoutGitMetadata() async throws {
+    @Test func ordinaryFoldersAreFavoritesWithoutGitMetadata() async throws {
         let fixture: SidebarFixture = try sidebarFixture()
         defer { removeSidebarFixture(fixture) }
         let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
-        try await model.star(fixture.folder)
-        #expect(model.isStarred(fixture.folder))
-        #expect(model.starred.first?.title == "folder")
+        try await model.addFavorites([fixture.folder], at: model.favorites.count)
+        #expect(model.isFavorite(fixture.folder))
+        #expect(model.favorites.last?.title == "folder")
     }
 
     @Test func filesFailExplicitlyAndAreNeverPersisted() async throws {
@@ -75,11 +75,11 @@ private func removeSidebarFixture(_ fixture: SidebarFixture) {
         try Data("file".utf8).write(to: file)
         let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
         await #expect(throws: SidebarLocationError.notFolder(file.path)) {
-            try await model.star(file)
+            try await model.addFavorites([file], at: model.favorites.count)
         }
-        #expect(model.starred.isEmpty)
-        #expect(SidebarLocationError.notFolder(file.path).errorDescription?.contains("Only folders can be starred") == true)
-        #expect(SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults).starred.isEmpty)
+        #expect(!model.isFavorite(file))
+        #expect(SidebarLocationError.notFolder(file.path).errorDescription?.contains("Only folders can be added to Favorites") == true)
+        #expect(!SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults).isFavorite(file))
     }
 
     @Test func symlinkAliasesKeepTheirOwnPathIdentity() async throws {
@@ -88,9 +88,9 @@ private func removeSidebarFixture(_ fixture: SidebarFixture) {
         let alias: URL = fixture.root.appendingPathComponent("alias")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.folder)
         let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
-        try await model.star(fixture.folder)
-        try await model.star(alias)
-        #expect(Set(model.starred.map(\.id)) == Set([fixture.folder.path, alias.path]))
+        try await model.addFavorites([fixture.folder], at: model.favorites.count)
+        try await model.addFavorites([alias], at: model.favorites.count)
+        #expect(model.favorites.suffix(2).map(\.id) == [fixture.folder.path, alias.path])
     }
 
     @Test func unavailableFoldersAndBrokenLinksFailWithTheirOriginalPaths() async throws {
@@ -102,14 +102,63 @@ private func removeSidebarFixture(_ fixture: SidebarFixture) {
         let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
         for url in [missing, broken] {
             do {
-                try await model.star(url)
-                Issue.record("An unavailable folder was starred: \(url.path)")
+                try await model.addFavorites([url], at: model.favorites.count)
+                Issue.record("An unavailable folder was added to Favorites: \(url.path)")
             } catch SidebarLocationError.folderUnavailable(let path, let reason) {
                 #expect(path == url.path)
                 #expect(!reason.isEmpty)
             } catch { Issue.record(error) }
         }
-        #expect(model.starred.isEmpty)
+        #expect(model.favorites.count == 5)
+    }
+
+    @Test func previousStarredFoldersMigrateIntoFavorites() throws {
+        let fixture: SidebarFixture = try sidebarFixture()
+        defer { removeSidebarFixture(fixture) }
+        fixture.defaults.set([fixture.folder.path], forKey: "sidebar.starredFolders")
+        let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
+        #expect(model.favorites.last?.id == fixture.folder.path)
+        model.removeFavorite(fixture.folder)
+        #expect(!SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults).isFavorite(fixture.folder))
+    }
+
+    @Test func folderDropsInsertAtTheRequestedPositionAndDeduplicate() async throws {
+        let fixture: SidebarFixture = try sidebarFixture()
+        defer { removeSidebarFixture(fixture) }
+        let second: URL = fixture.root.appendingPathComponent("another folder")
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
+        try await model.addFavorites([fixture.folder, second, fixture.folder], at: 1)
+        #expect(model.favorites[1].id == fixture.folder.path)
+        #expect(model.favorites[2].id == second.path)
+        #expect(model.favorites.count == 7)
+        let restored: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
+        #expect(restored.favorites == model.favorites)
+    }
+
+    @Test func anInvalidDropDoesNotPartiallyPinFolders() async throws {
+        let fixture: SidebarFixture = try sidebarFixture()
+        defer { removeSidebarFixture(fixture) }
+        let file: URL = fixture.root.appendingPathComponent("file.txt")
+        try Data("file".utf8).write(to: file)
+        let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
+        let original: [SidebarLocation] = model.favorites
+        await #expect(throws: SidebarLocationError.notFolder(file.path)) {
+            try await model.addFavorites([fixture.folder, file], at: 0)
+        }
+        #expect(model.favorites == original)
+        #expect(SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults).favorites == original)
+    }
+
+    @Test func webURLsCannotPinMatchingLocalPaths() async throws {
+        let fixture: SidebarFixture = try sidebarFixture()
+        defer { removeSidebarFixture(fixture) }
+        let model: SidebarLocations = SidebarLocations(homeURL: fixture.root, defaults: fixture.defaults)
+        let url: URL = try #require(URL(string: "https://example.com" + fixture.folder.path))
+        await #expect(throws: FileOperationError.failed("Read path", url, "Expected a file URL")) {
+            try await model.addFavorites([url], at: 0)
+        }
+        #expect(!model.isFavorite(fixture.folder))
     }
 
     @Test func volumeLocationsSeparateNetworkFromLocalAndAlwaysIncludeHome() {

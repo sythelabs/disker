@@ -16,7 +16,6 @@ struct ContentView: View {
     @State private var showingIssues: Bool = false
     @State private var folderPickerError: String?
     @State private var fileOperationError: String?
-    @State private var folderStarError: String?
     @State private var previewURL: URL?
     @State private var renaming: FileItem?
     @State private var choosingApplication: Bool = false
@@ -67,10 +66,6 @@ struct ContentView: View {
                             case .failure(let error): folderPickerError = error.localizedDescription
                             }
                         }
-                    Button(locations.isStarred(rootURL) ? "Unstar Folder" : "Star Folder", systemImage: locations.isStarred(rootURL) ? "star.fill" : "star") {
-                        toggleStar(rootURL)
-                    }
-                    .help("Keep this folder in the sidebar")
                     if model.isScanning {
                         Button("Stop Scan", systemImage: "stop.fill") { model.cancelScan() }
                     } else {
@@ -100,9 +95,6 @@ struct ContentView: View {
         .alert("File operation failed", isPresented: Binding(get: { fileOperationError != nil }, set: { if !$0 { fileOperationError = nil } })) {
             Button("OK", role: .cancel) { fileOperationError = nil }
         } message: { Text(fileOperationError ?? "") }
-        .alert("Could not star folder", isPresented: Binding(get: { folderStarError != nil }, set: { if !$0 { folderStarError = nil } })) {
-            Button("OK", role: .cancel) { folderStarError = nil }
-        } message: { Text(folderStarError ?? "") }
         .quickLookPreview($previewURL)
         .sheet(item: $renaming) { item in
             RenameItemSheet(item: item) { name in
@@ -138,7 +130,7 @@ struct ContentView: View {
     }
 
     private var tree: some View {
-        Table(visibleRows, selection: $selection) {
+        Table(of: DiskTreeRow.self, selection: $selection) {
             TableColumn("Name") { row in
                 TreeNameCell(row: row, model: model)
             }
@@ -169,6 +161,15 @@ struct ContentView: View {
             .alignment(.trailing)
             TableColumn("Items") { row in
                 if let node: IndexedNode = row.node {
+        } rows: {
+            ForEach(visibleRows) { row in
+                TableRow(row)
+                    .itemProvider {
+                        guard let node: IndexedNode = row.node, node.entry.metadata.kind == .directory else { return nil }
+                        do { return NSItemProvider(object: try FileItem(entry: node.entry).url as NSURL) }
+                        catch { fileOperationError = error.localizedDescription; return nil }
+                    }
+            }
                     Text((node.entry.metadata.kind == .directory ? max(0, node.subtreeNodeCount - 1) : 1).formatted())
                         .monospacedDigit()
                 }
@@ -240,7 +241,6 @@ struct ContentView: View {
         Binding(
             get: {
                 let destinations: [SidebarSelection] = locations.favorites.map { SidebarSelection(section: .favorites, path: $0.id) }
-                    + locations.starred.map { SidebarSelection(section: .starred, path: $0.id) }
                     + locations.local.map { SidebarSelection(section: .local, path: $0.id) }
                     + locations.network.map { SidebarSelection(section: .network, path: $0.id) }
                 if let sidebarSelection, sidebarSelection.path == model.rootPath, destinations.contains(sidebarSelection) { return sidebarSelection }
@@ -256,16 +256,6 @@ struct ContentView: View {
     private func chooseRoot(_ url: URL) {
         selection = nil
         Task { await model.chooseRoot(url) }
-    }
-
-    private func toggleStar(_ url: URL) {
-        if locations.isStarred(url) { locations.unstar(url) }
-        else {
-            Task {
-                do { try await locations.star(url) }
-                catch { folderStarError = error.localizedDescription }
-            }
-        }
     }
 
     private func node(in ids: Set<DiskTreeRowID>) -> IndexedNode? {
@@ -291,9 +281,6 @@ struct ContentView: View {
             }
         } else {
             Button(model.expanded.contains(item.id) ? "Collapse Folder" : "Expand Folder") { Task { await model.toggle(item.id) } }
-            Button(locations.isStarred(item.url) ? "Unstar Folder" : "Star Folder", systemImage: locations.isStarred(item.url) ? "star.fill" : "star") {
-                toggleStar(item.url)
-            }
         }
         Button("Quick Look", systemImage: "eye") { previewURL = item.url }
             .keyboardShortcut(.space, modifiers: [])
