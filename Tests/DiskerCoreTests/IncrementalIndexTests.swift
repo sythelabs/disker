@@ -183,7 +183,8 @@ struct IncrementalIndexTests {
         }
         var expectedBytes: UInt64 = 9600
         var expectedCount: Int64 = 2403
-        try mutateAfterJournalFence(root: fixture.root, requiredDirectories: [branch.path]) {
+        let changedDirectory: String = [.remove, .replaceWithFile, .replaceRoot].contains(mutation) ? fixture.root.path : branch.path
+        try mutateAfterJournalFence(root: fixture.root, requiredDirectories: [changedDirectory]) {
             switch mutation {
             case .resize:
                 try Data(repeating: 2, count: 19).write(to: branch.appendingPathComponent("file-0"))
