@@ -130,6 +130,43 @@ struct IncrementalIndexTests {
         #expect(entries.filter { $0.metadata.kind != .directory }.reduce(UInt64(0)) { $0 + $1.metadata.logicalBytes } == (mutation == .remove ? 5 : 16))
     }
 
+    @Test func completedDirectoriesAreDurableBeforeScanningTheNextDirectory() throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("a"), count: 1, bytes: 3)
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
+        let database: URL = fixture.container.appendingPathComponent("pending.sqlite")
+        let pending: PendingScan = try PendingScan(databaseURL: database, root: fixture.root.path)
+        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
+        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
+        try pending.prepare(revision: 1, metadata: metadata, options: options,
+            replay: JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false))
+        var configuration: Configuration = Configuration()
+        configuration.readonly = true
+        let reader: DatabaseQueue = try DatabaseQueue(path: database.path, configuration: configuration)
+        let checkpoints: Mutex<Int> = Mutex(0)
+        let previousFraction: Mutex<Double> = Mutex(0)
+        _ = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
+            receiveEvent: { event in
+                guard case .progress(let progress) = event else { return }
+                let completed: Bool = previousFraction.withLock { previous in
+                    guard progress.completionFraction > previous else { return false }
+                    previous = progress.completionFraction
+                    return true
+                }
+                guard completed else { return }
+                do {
+                    let stored: Row = try reader.read { db in
+                        try Row.fetchOne(db, sql: "SELECT count,fraction FROM scans WHERE root=?", arguments: [fixture.root.path])!
+                    }
+                    #expect(stored["count"] as Int64 == progress.entriesObserved)
+                    #expect((stored["fraction"] as Double) * 0.95 == progress.completionFraction)
+                    checkpoints.withLock { $0 += 1 }
+                } catch { Issue.record(error) }
+            }, isCancelled: { false })
+        #expect(checkpoints.withLock { $0 } >= 3)
+    }
+
     @Test(arguments: ResumeMutation.allCases)
     fileprivate func resumedScanReconcilesChangesMadeWhileClosed(mutation: ResumeMutation) async throws {
         let fixture: IncrementalFixture = try incrementalFixture()

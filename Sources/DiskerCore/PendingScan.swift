@@ -99,12 +99,10 @@ final class PendingScan: Sendable {
             var lastCheckpoint: ContinuousClock.Instant = .now
             try db.beginTransaction(.immediate)
             func checkpoint() throws {
-                if uncommittedEntries >= 4096 || lastCheckpoint.duration(to: .now) >= .milliseconds(250) {
-                    try db.commit()
-                    try db.beginTransaction(.immediate)
-                    uncommittedEntries = 0
-                    lastCheckpoint = .now
-                }
+                try db.commit()
+                try db.beginTransaction(.immediate)
+                uncommittedEntries = 0
+                lastCheckpoint = .now
             }
             do {
                 while let job: PendingDirectory = try nextJob(db: db) {
@@ -124,7 +122,9 @@ final class PendingScan: Sendable {
                             summary = try DirectoryScanner.enumerateDirectory(path: job.path, options: options, isCancelled: isCancelled, receiveProgress: { _ in }) { batch in
                                 try save(db: db, batch: batch)
                                 uncommittedEntries += batch.count
-                                try checkpoint()
+                                if uncommittedEntries >= 4096 || lastCheckpoint.duration(to: .now) >= .milliseconds(250) {
+                                    try checkpoint()
+                                }
                                 receiveEvent(.batch(batch))
                                 try publishProgress(db: db, previousNodeCount: previousNodeCount, start: start, receiveEvent: receiveEvent)
                             }
