@@ -115,5 +115,5 @@ jobs:
           test -s appcast.xml
           gh release create "v$VERSION" Disker-*.zip appcast.xml SHA256SUMS.txt \
             --target "$COMMIT_SHA" --title "Disker $VERSION" --generate-notes --draft
-          release_id=$(gh api "repos/$GH_REPO/releases/tags/v$VERSION" --jq '.id')
+          release_id=$(gh release view "v$VERSION" --json databaseId --jq '.databaseId')
           gh api --method PATCH "repos/$GH_REPO/releases/$release_id" -F draft=false -f make_latest=legacy --jq '.html_url'
