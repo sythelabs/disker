@@ -15,7 +15,7 @@ struct LaunchView: View {
     @State private var failure: String?
 
     var body: some View {
-        Group {
+        ZStack {
             if ready {
                 ContentView(rootURL: rootURL, cacheURL: cacheURL)
             } else if let failure {
