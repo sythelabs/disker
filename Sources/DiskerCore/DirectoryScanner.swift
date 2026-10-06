@@ -104,6 +104,16 @@ private struct DirectoryJob {
 }
 
 public enum DirectoryScanner {
+    static func directoryMetadata(path: Data) throws -> FileMetadata {
+        let descriptor: Int32 = openRoot(path)
+        guard descriptor >= 0 else { throw ScanError.systemCall(path: path, operation: "open", errnoCode: errno) }
+        defer { _ = close(descriptor) }
+        var native: disker_metadata_t = disker_metadata_t()
+        let code: Int32 = disker_metadata_for_descriptor(descriptor, &native)
+        guard code == 0 else { throw ScanError.systemCall(path: path, operation: "fstat", errnoCode: code) }
+        return metadata(native)
+    }
+
     public static func scan(root: Data, options: ScanOptions, isCancelled: @Sendable () -> Bool,
                             receiveProgress: (Double) -> Void,
                             receiveBatch: ([ScanEntry]) throws -> Void) throws -> ScanSummary {

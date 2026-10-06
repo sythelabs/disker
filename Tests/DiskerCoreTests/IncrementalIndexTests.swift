@@ -22,6 +22,10 @@ private enum RetryMutation: CaseIterable, Sendable {
     case replaceWithFile
 }
 
+private enum ResumeMutation: CaseIterable, Sendable {
+    case resize, addSubtree, remove, replaceWithFile, replaceRoot
+}
+
 private func incrementalFixture() throws -> IncrementalFixture {
     let container: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-incremental-\(UUID().uuidString)").resolvingSymlinksInPath()
     let root: URL = container.appendingPathComponent("root", isDirectory: true)
@@ -94,6 +98,123 @@ private func waitForIncrementalSignal(_ semaphore: DispatchSemaphore, timeout: D
 
 @Suite("Incremental index", .serialized)
 struct IncrementalIndexTests {
+    @Test(arguments: ResumeMutation.allCases)
+    fileprivate func resumedScanReconcilesChangesMadeWhileClosed(mutation: ResumeMutation) async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let branch: URL = fixture.root.appendingPathComponent("a")
+        try createIncrementalFiles(directory: branch, count: 1200, bytes: 3)
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1200, bytes: 5)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let cancelled: Mutex<Bool> = Mutex(false)
+        await #expect(throws: ScanError.cancelled) {
+            try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in
+                if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
+            }, isCancelled: { cancelled.withLock { $0 } })
+        }
+        var expectedBytes: UInt64 = 9600
+        var expectedCount: Int64 = 2403
+        try mutateAfterJournalFence(root: fixture.root, requiredDirectories: [branch.path]) {
+            switch mutation {
+            case .resize:
+                try Data(repeating: 2, count: 19).write(to: branch.appendingPathComponent("file-0"))
+                expectedBytes += 16
+            case .addSubtree:
+                try createIncrementalFiles(directory: branch.appendingPathComponent("new"), count: 1, bytes: 37)
+                expectedBytes += 37
+                expectedCount += 2
+            case .remove:
+                try FileManager.default.removeItem(at: branch)
+                expectedBytes = 6000
+                expectedCount = 1202
+            case .replaceWithFile:
+                try FileManager.default.removeItem(at: branch)
+                try Data(repeating: 2, count: 11).write(to: branch)
+                expectedBytes = 6011
+                expectedCount = 1203
+            case .replaceRoot:
+                try FileManager.default.moveItem(at: fixture.root, to: fixture.container.appendingPathComponent("old-root"))
+                try createIncrementalFiles(directory: fixture.root, count: 1, bytes: 9)
+                expectedBytes = 9
+                expectedCount = 2
+            }
+        }
+        let reopened: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let resumed: IndexSummary = try await reopened.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { _ in }, isCancelled: { false })
+        #expect(resumed.logicalBytes == expectedBytes)
+        #expect(resumed.nodeCount == expectedCount)
+        #expect(resumed.isComplete)
+        if [.remove, .replaceWithFile, .replaceRoot].contains(mutation) {
+            #expect(try await reopened.node(root: fixture.root.path, path: Data(branch.appendingPathComponent("file-0").path.utf8)) == nil)
+        }
+    }
+
+    @Test func interruptedInitialScanRestoresProgressAndFinishesAfterReopening() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("a"), count: 1200, bytes: 3)
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1200, bytes: 5)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let cancelled: Mutex<Bool> = Mutex(false)
+        let savedProgress: Mutex<Double> = Mutex(0)
+        await #expect(throws: ScanError.cancelled) {
+            try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in
+                if case .progress(let progress) = event, progress.completionFraction > 0.4 {
+                    savedProgress.withLock { $0 = progress.completionFraction }
+                    cancelled.withLock { $0 = true }
+                }
+            }, isCancelled: { cancelled.withLock { $0 } })
+        }
+        #expect(try await index.cachedSummary(root: fixture.root.path) == nil)
+        let reopened: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let firstProgress: Mutex<IndexProgress?> = Mutex(nil)
+        let summary: IndexSummary = try await reopened.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { event in
+            if case .progress(let progress) = event { firstProgress.withLock { if $0 == nil { $0 = progress } } }
+        }, isCancelled: { false })
+        #expect(firstProgress.withLock { $0?.completionFraction } == savedProgress.withLock { $0 })
+        #expect(firstProgress.withLock { $0?.entriesObserved ?? 0 } >= 1203)
+        #expect(summary.logicalBytes == 9600)
+        #expect(summary.nodeCount == 2403)
+        #expect(summary.isComplete)
+        #expect(summary.metrics.entries < 2403, "The completed branch must not be enumerated again")
+        #expect(try await reopened.node(root: fixture.root.path, path: Data(fixture.root.appendingPathComponent("a").path.utf8))?.subtreeLogicalBytes == 3600)
+    }
+
+    @Test func repeatedInterruptionsRetainCompletedBranchesAndRetryOnlyTheUnfinishedDirectory() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("a"), count: 1200, bytes: 3)
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 2400, bytes: 5)
+        var retainedEntries: Int64 = 0
+        for attempt: Int in 0..<3 {
+            let reopened: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+            let cancelled: Mutex<Bool> = Mutex(false)
+            let observed: Mutex<Int64> = Mutex(0)
+            let first: Mutex<IndexProgress?> = Mutex(nil)
+            await #expect(throws: ScanError.cancelled) {
+                try await reopened.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { event in
+                    guard case .progress(let progress) = event else { return }
+                    first.withLock { if $0 == nil { $0 = progress } }
+                    observed.withLock { $0 = progress.entriesObserved }
+                    if (attempt == 0 && progress.completionFraction > 0.4) || (attempt > 0 && progress.entriesObserved > 1700) {
+                        cancelled.withLock { $0 = true }
+                    }
+                }, isCancelled: { cancelled.withLock { $0 } })
+            }
+            if attempt > 0 {
+                #expect(first.withLock { $0?.entriesObserved } == retainedEntries)
+                #expect(first.withLock { $0?.completionFraction ?? 0 } > 0.4)
+            }
+            retainedEntries = observed.withLock { $0 }
+        }
+        let reopened: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let summary: IndexSummary = try await reopened.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { _ in }, isCancelled: { false })
+        #expect(summary.logicalBytes == 15600)
+        #expect(summary.nodeCount == 3603)
+        #expect(summary.metrics.entries < 3603)
+        #expect(summary.isComplete)
+    }
+
     @Test func explicitDirectoriesImmediatelyReconcileFileOperationsWithoutWalkingUntouchedBranches() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }

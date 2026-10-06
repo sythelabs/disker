@@ -28,6 +28,17 @@ The first implementation conservatively fully reconciles `/` because its tree sp
 
 Transactions keep the previous committed snapshot valid if cancelled or interrupted. Incomplete scans retain older unreachable subtrees and expose issues; these totals may contain stale metadata. Unchanged permission gaps reuse the cache without rescanning the accessible tree. A filesystem event or explicit full refresh retries them. Transient scan errors retry affected scopes, and successful reconciliation removes resolved issues. Root identity changes, including changed device identity after a remount, can force full reconciliation.
 
+### Interrupted full scans
+
+- Problem: keeping the entire initial traversal in the committed index transaction discarded every observed file on quit, so short sessions repeatedly resized the same branches.
+- Usage: callers continue using `DiskIndex.refresh(root:mode:receiveEvent:isCancelled:)`. The operation resumes compatible unfinished full scans automatically; cached queries continue returning only committed snapshots. Initial previews and directory-based progress are restored through the existing events.
+- Shape: `PendingScan` owns a private GRDB sidecar next to the index. Raw entries, pending directory jobs, completed-directory identity claims, issues, and progress commit in bounded transactions of 4,096 entries or 250 ms, independent of the 512-entry UI batches. Cancellation flushes valid partial work; a crash loses only the current transaction. An unfinished directory restarts its enumeration, while completed unchanged directories remain sealed.
+- Replay: root identity, semantic scan options, and the base revision fence reuse. FSEvents invalidations and the sidecar cursor advance in one transaction. The completed index cursor advances only after all staged rows, reconciliation, aliases, and totals commit together. A crash after index commit is safe because the changed base revision rejects obsolete staging.
+- Synthesis decision: combine the durable frontier candidate with isolated staging and the existing atomic final import. Enumeration-only caching lost because it repeated prefix traversal/upserts before making new progress. Generation pointer promotion avoided the final import but required changing every committed node, alias, and Git query.
+- Tradeoffs accepted: retain a second copy of scanned metadata until promotion, and accept one final O(N) import/aggregation in exchange for unchanged committed readers and smaller schema impact. Coalesce small directory transactions to limit synchronous-commit cost.
+- Risks: `/` spans device journals and has no durable replay coverage, so its interrupted scans conservatively restart. Lost journal history or replaced roots also restart. Progress is an estimate; newly discovered work can keep the bar below completion until the snapshot commits.
+- Validation: cancellation/reopen, repeated interruption inside a large directory, changes while closed, root replacement, restored native model rows, and process termination must preserve exact counts without rereading completed branches. Measure the 100,000-file release fixture before shipping.
+
 FSEvents delivery is asynchronous: a refresh immediately after a write may still return the previous state. Subsequent refreshes converge when events arrive. There is no atomic live-filesystem snapshot: concurrent writes can continue after any reconciliation boundary.
 
 ## Git enrichment
@@ -36,7 +47,7 @@ Detect `.git` markers during traversal without subprocesses. Perform Git command
 
 ## Progress and performance
 
-Stream batches and progress counters: entries and bytes observed, elapsed time, previous node count, and completion. Final summaries additionally report directories, bulk calls, and metadata calls. The first scan has no reliable total, so progress is indeterminate. A previous node count is an estimate, not a trustworthy percentage. Benchmarks report a full scan with an empty application cache, cached reopening/query, a separate-process summary query, unchanged refresh, changed refresh, nodes/second, cache size, and peak process RSS. Resize measurements separate the successful reconciliation call from total convergence time, including event delivery and retries. Freshly created fixture files have warm OS filesystem caches; this is not a cold-disk measurement.
+Stream batches and progress counters: entries and bytes observed, elapsed time, previous node count, and weighted directory completion. Restore retained entries and completion on resume. Final summaries report newly performed filesystem work, including directories, bulk calls, and metadata calls; restored rows do not inflate these metrics. A previous node count is an estimate, not a trustworthy percentage. Benchmarks report a full scan with an empty application cache, cached reopening/query, a separate-process summary query, unchanged refresh, changed refresh, nodes/second, cache size, and peak process RSS. Resize measurements separate the successful reconciliation call from total convergence time, including event delivery and retries. Freshly created fixture files have warm OS filesystem caches; this is not a cold-disk measurement.
 
 ## Validation
 

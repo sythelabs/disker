@@ -68,6 +68,47 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
 
 @Suite("Disk tree model", .serialized)
 @MainActor struct DiskTreeModelTests {
+    @Test func reopenedInitialScanRestoresVisibleBranchSizesAndProgress() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let branch: URL = fixture.root.appendingPathComponent("a")
+        let pending: URL = fixture.root.appendingPathComponent("b")
+        try treeFiles(directory: branch, count: 1200, bytes: 3)
+        try treeFiles(directory: pending, count: 1200, bytes: 5)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.cache)
+        let cancelled: Mutex<Bool> = Mutex(false)
+        await #expect(throws: ScanError.cancelled) {
+            try await index.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { event in
+                if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
+            }, isCancelled: { cancelled.withLock { $0 } })
+        }
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let paused: Mutex<Bool> = Mutex(false)
+        defer { release.signal() }
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            guard case .batch(let entries) = event, entries.contains(where: { $0.parentPath == Data(pending.path.utf8) }) else { return }
+            let first: Bool = paused.withLock { state in
+                if state { return false }
+                state = true
+                return true
+            }
+            if first, release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing resumed scan") }
+        })
+        await model.start()
+        let deadline: Date = Date().addingTimeInterval(5)
+        while (!paused.withLock { $0 } || model.scanProgress < 0.4) && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(model.isScanning)
+        #expect(model.summary == nil)
+        #expect(model.scanProgress > 0.4)
+        let restored: IndexedNode = try #require(model.rows.compactMap(\.node).first { $0.entry.path == Data(branch.path.utf8) })
+        #expect(restored.subtreeLogicalBytes == 3600)
+        #expect(restored.subtreeNodeCount == 1201)
+        release.signal()
+        try await waitForTreeScan(model)
+        #expect(model.summary?.logicalBytes == 9600)
+        #expect(model.errorMessage == nil)
+    }
+
     @Test(arguments: [(0, 1), (0, 510), (510, 510)])
     func foldersExpandBeforeTheInitialScanCommits(rootFileCount: Int, folderFileCount: Int) async throws {
         let fixture: TreeFixture = try treeFixture()
