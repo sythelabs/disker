@@ -223,7 +223,7 @@ public actor DiskIndex {
                     throw ScanError.systemCall(path: Data(path.utf8), operation: operation, errnoCode: code)
                 }
                 defer { journal.stop() }
-                let replay: JournalReplay = try journal.replay(timeout: 10)
+                let replay: JournalReplay = try journal.replay(timeout: 10, isCancelled: isCancelled)
                 var rootChanged: Bool = false
                 if let previous: Data = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(normalized.utf8)]) {
                     let saved: FileMetadata = try decodeMetadata(previous)
