@@ -99,12 +99,10 @@ final class PendingScan: Sendable {
             var lastCheckpoint: ContinuousClock.Instant = .now
             try db.beginTransaction(.immediate)
             func checkpoint() throws {
-                if uncommittedEntries >= 4096 || lastCheckpoint.duration(to: .now) >= .milliseconds(250) {
-                    try db.commit()
-                    try db.beginTransaction(.immediate)
-                    uncommittedEntries = 0
-                    lastCheckpoint = .now
-                }
+                try db.commit()
+                try db.beginTransaction(.immediate)
+                uncommittedEntries = 0
+                lastCheckpoint = .now
             }
             do {
                 while let job: PendingDirectory = try nextJob(db: db) {
@@ -124,7 +122,9 @@ final class PendingScan: Sendable {
                             summary = try DirectoryScanner.enumerateDirectory(path: job.path, options: options, isCancelled: isCancelled, receiveProgress: { _ in }) { batch in
                                 try save(db: db, batch: batch)
                                 uncommittedEntries += batch.count
-                                try checkpoint()
+                                if uncommittedEntries >= 4096 || lastCheckpoint.duration(to: .now) >= .milliseconds(250) {
+                                    try checkpoint()
+                                }
                                 receiveEvent(.batch(batch))
                                 try publishProgress(db: db, previousNodeCount: previousNodeCount, start: start, receiveEvent: receiveEvent)
                             }
@@ -133,6 +133,10 @@ final class PendingScan: Sendable {
                         }
                     } catch ScanError.systemCall(let path, let operation, let code) where job.path != rootPath {
                         opened = nil
+                        if code == ENOENT || code == ENOTDIR {
+                            try removeDescendants(db: db, path: job.path)
+                            try invalidate(db: db, path: pendingParent(job.path))
+                        }
                         let kind: ScanIssueKind = (code == EACCES || code == EPERM) ? .permissionDenied : ((code == ENOENT || code == ENOTDIR) ? .vanished : .ioError)
                         summary = ScanSummary(metrics: metricsZero(), issues: [ScanIssue(kind: kind, path: path, operation: operation, errnoCode: code)], aliases: [])
                     }
