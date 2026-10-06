@@ -529,6 +529,7 @@ struct SizeProportionBar: View {
             .tint(.accentColor)
             .accessibilityLabel("Share of parent folder")
             .accessibilityValue(proportion.formatted(.percent.precision(.fractionLength(1))))
+            .allowsHitTesting(false)
             .transaction { transaction in
                 transaction.animation = nil
                 transaction.disablesAnimations = true
