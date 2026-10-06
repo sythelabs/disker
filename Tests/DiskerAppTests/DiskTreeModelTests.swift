@@ -96,7 +96,11 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         })
         await model.start()
         let deadline: Date = Date().addingTimeInterval(5)
-        while (!paused.withLock { $0 } || model.scanProgress < 0.4) && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        while Date() < deadline {
+            let branchNode: IndexedNode? = model.rows.compactMap(\.node).first { $0.entry.path == Data(branch.path.utf8) }
+            if paused.withLock({ $0 }), model.scanProgress > 0.4, branchNode?.subtreeNodeCount == 1201 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         #expect(model.isScanning)
         #expect(model.summary == nil)
         #expect(model.scanProgress > 0.4)
