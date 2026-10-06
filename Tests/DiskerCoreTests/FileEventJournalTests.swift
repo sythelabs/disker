@@ -28,18 +28,17 @@ struct FileEventJournalTests {
     @Test(arguments: [Array(UInt64(11)...25), [UInt64](repeating: 25, count: 15), Array((UInt64(11)...25).reversed())])
     func activeHistoryReplayCanExceedItsInactivityTimeout(eventIDs: [UInt64]) throws {
         let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: true)
-        let finished: DispatchSemaphore = DispatchSemaphore(value: 0)
-        DispatchQueue(label: "DiskerTests.JournalHistory").async {
-            defer { finished.signal() }
-            for eventID: UInt64 in eventIDs {
-                deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified), eventID: eventID)
-                Thread.sleep(forTimeInterval: 0.02)
-            }
-            deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagHistoryDone), eventID: 25)
-        }
-        defer { finished.wait() }
+        var identifiers: IndexingIterator<[UInt64]> = eventIDs.makeIterator()
         let start: ContinuousClock.Instant = ContinuousClock.now
-        try buffer.waitForHistory(timeout: 0.1, isCancelled: { false })
+        try buffer.waitForHistory(timeout: 0.1, isCancelled: {
+            // Deliver at each wait iteration so queue scheduling cannot manufacture an idle gap.
+            if let eventID: UInt64 = identifiers.next() {
+                deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified), eventID: eventID)
+            } else {
+                deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagHistoryDone), eventID: 25)
+            }
+            return false
+        })
         #expect(start.duration(to: .now) >= .milliseconds(200))
         let replay: JournalReplay = buffer.snapshot()
         #expect(replay.dirtyDirectories == ["/fixture"])
