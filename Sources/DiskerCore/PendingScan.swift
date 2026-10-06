@@ -133,6 +133,10 @@ final class PendingScan: Sendable {
                         }
                     } catch ScanError.systemCall(let path, let operation, let code) where job.path != rootPath {
                         opened = nil
+                        if code == ENOENT || code == ENOTDIR {
+                            try removeDescendants(db: db, path: job.path)
+                            try invalidate(db: db, path: pendingParent(job.path))
+                        }
                         let kind: ScanIssueKind = (code == EACCES || code == EPERM) ? .permissionDenied : ((code == ENOENT || code == ENOTDIR) ? .vanished : .ioError)
                         summary = ScanSummary(metrics: metricsZero(), issues: [ScanIssue(kind: kind, path: path, operation: operation, errnoCode: code)], aliases: [])
                     }

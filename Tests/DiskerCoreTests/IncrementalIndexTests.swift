@@ -98,6 +98,38 @@ private func waitForIncrementalSignal(_ semaphore: DispatchSemaphore, timeout: D
 
 @Suite("Incremental index", .serialized)
 struct IncrementalIndexTests {
+    @Test(arguments: RetryMutation.allCases)
+    fileprivate func resumedDirtyDirectoryRemovedOrReplacedDropsItsOldDescendants(mutation: RetryMutation) throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let branch: URL = fixture.root.appendingPathComponent("a")
+        try createIncrementalFiles(directory: branch, count: 1, bytes: 3)
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
+        let pending: PendingScan = try PendingScan(databaseURL: fixture.container.appendingPathComponent("pending.sqlite"), root: fixture.root.path)
+        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
+        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
+        try pending.prepare(revision: 1, metadata: metadata, options: options,
+            replay: JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false))
+        let cancelled: Mutex<Bool> = Mutex(false)
+        #expect(throws: ScanError.cancelled) {
+            try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
+                receiveEvent: { event in
+                    if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
+                }, isCancelled: { cancelled.withLock { $0 } })
+        }
+        try FileManager.default.removeItem(at: branch)
+        if mutation == .replaceWithFile { try Data(repeating: 2, count: 11).write(to: branch) }
+        try pending.prepare(revision: 1, metadata: metadata, options: options,
+            replay: JournalReplay(checkpoint: nil, dirtyDirectories: [branch.path], recursiveDirectories: [], requiresFullScan: false))
+        _ = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
+            receiveEvent: { _ in }, isCancelled: { false })
+        var entries: [ScanEntry] = []
+        try pending.replay(isCancelled: { false }) { entries += $0 }
+        #expect(!entries.contains { $0.path == Data(branch.appendingPathComponent("file-0").path.utf8) })
+        #expect(entries.count == (mutation == .remove ? 3 : 4))
+        #expect(entries.filter { $0.metadata.kind != .directory }.reduce(UInt64(0)) { $0 + $1.metadata.logicalBytes } == (mutation == .remove ? 5 : 16))
+    }
+
     @Test(arguments: ResumeMutation.allCases)
     fileprivate func resumedScanReconcilesChangesMadeWhileClosed(mutation: ResumeMutation) async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
