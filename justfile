@@ -9,6 +9,18 @@ release:
     swift build -c release --product Disker --arch arm64 --arch x86_64
     just _bundle "$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/Disker"
 
+dmg: release
+    just package-dmg .build/Disker.app
+
+package-dmg app:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$1/Contents/Info.plist")
+    mkdir -p dist
+    image="dist/Disker-$version-macOS-universal.dmg"
+    uvx --from dmgbuild==1.6.7 dmgbuild -s Resources/Installer/dmg-settings.py -D "app=$1" "Install Disker" "$image"
+    uvx --with dmgbuild==1.6.7 python .github/scripts/verify_dmg.py "$image" "$1"
+
 [private]
 _bundle binary:
     rm -rf .build/Disker.app

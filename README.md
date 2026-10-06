@@ -12,13 +12,15 @@
 
 Download the universal macOS app from [GitHub Releases](https://github.com/sythelabs/disker/releases/latest). Builds support Apple Silicon and Intel Macs running macOS 26 or later. The app is ad-hoc signed and is not notarized.
 
+Open the DMG and drag Disker into the Applications folder shown in the installer window. Eject the installer, then open Disker from Applications.
+
 Install version 0.1.4 or later once in a writable location, such as `/Applications`. Disker then checks for updates daily, downloads them automatically, and installs them when you quit. Use **Disker > Check for Updates** to install the latest release immediately. Updates and the update feed are authenticated with Ed25519 signatures. [Update publishing and signing](docs/self-updates.md).
 
 ## Contributing and releases
 
 Changes to `main` require a pull request with passing `Version increase` and `Build and test` checks. Every PR must increase both `CFBundleShortVersionString` (stable `major.minor.patch`) and `CFBundleVersion` (positive integer) in `Info.plist` relative to the latest target branch. Update stale PRs after another version merges.
 
-Every push to `main` runs the Swift tests, builds and verifies a universal release app, signs the ZIP and update feed, and publishes a `v<version>` GitHub Release containing the app ZIP, `appcast.xml`, and SHA-256 checksums. PR builds are available as workflow artifacts. `just release` builds the same app locally at `.build/Disker.app`.
+Every push to `main` runs the Swift tests, builds and verifies a universal release app, signs the ZIP and update feed, and publishes a `v<version>` GitHub Release containing the drag-to-install DMG, app ZIP, `appcast.xml`, and SHA-256 checksums. PR builds are available as workflow artifacts. `just release` builds the same app locally at `.build/Disker.app`. `just dmg` builds and verifies the installer in `dist/`; it requires `uv` for the pinned dmgbuild tool. `just package-dmg <app-bundle>` packages an existing universal app. The DMG is created after feed generation so Sparkle continues to use the ZIP update.
 
 ## Run
 

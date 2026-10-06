@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install just
-        run: brew install just
+        run: brew install just uv
       - name: Test
         run: just test
       - name: Build the universal release app
@@ -84,6 +84,14 @@ jobs:
             "dist/Disker-$VERSION-macOS-universal.zip" "$signature"
           cd dist
           shasum -a 256 Disker-*.zip appcast.xml > SHA256SUMS.txt
+      - name: Package and verify the drag-to-install DMG
+        run: |
+          just package-dmg .build/Disker.app
+          cd dist
+          shasum -a 256 Disker-*.zip Disker-*.dmg > SHA256SUMS.txt
+          if [ -f appcast.xml ]; then
+            shasum -a 256 appcast.xml >> SHA256SUMS.txt
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: Disker-macOS-universal
@@ -113,7 +121,7 @@ jobs:
           cd dist
           sha256sum --check SHA256SUMS.txt
           test -s appcast.xml
-          gh release create "v$VERSION" Disker-*.zip appcast.xml SHA256SUMS.txt \
+          gh release create "v$VERSION" Disker-*.dmg Disker-*.zip appcast.xml SHA256SUMS.txt \
             --target "$COMMIT_SHA" --title "Disker $VERSION" --generate-notes --draft
           release_id=$(gh release view "v$VERSION" --json databaseId --jq '.databaseId')
           gh api --method PATCH "repos/$GH_REPO/releases/$release_id" -F draft=false -f make_latest=legacy --jq '.html_url'
