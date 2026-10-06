@@ -11,11 +11,14 @@ release:
 
 [private]
 _bundle binary:
-    mkdir -p .build/Disker.app/Contents/MacOS .build/Disker.app/Contents/Resources
+    rm -rf .build/Disker.app
+    mkdir -p .build/Disker.app/Contents/MacOS .build/Disker.app/Contents/Resources .build/Disker.app/Contents/Frameworks
     cp "$1" .build/Disker.app/Contents/MacOS/Disker
     cp Info.plist .build/Disker.app/Contents/Info.plist
     cp Resources/Credits.rtf .build/Disker.app/Contents/Resources/Credits.rtf
     cp -R "$(dirname "$1")"/*.bundle .build/Disker.app/Contents/Resources/
+    ditto .build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework .build/Disker.app/Contents/Frameworks/Sparkle.framework
+    cp .build/artifacts/sparkle/Sparkle/LICENSE .build/Disker.app/Contents/Resources/Sparkle-LICENSE.txt
     xcrun actool Resources/AppIcon.icon --compile .build/Disker.app/Contents/Resources --app-icon AppIcon --platform macosx --minimum-deployment-target 26.0 --output-partial-info-plist .build/app-icon-info.plist
     /usr/libexec/PlistBuddy -c "Merge .build/app-icon-info.plist" .build/Disker.app/Contents/Info.plist
     codesign --force --sign - .build/Disker.app

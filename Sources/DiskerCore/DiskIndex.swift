@@ -247,6 +247,7 @@ public actor DiskIndex {
                         publishProgress()
                     }
                 }
+                // APFS directory link counts can vary between metadata queries; exclude them and access times from revisions.
                 let upsert: Statement = try db.makeStatement(sql: """
                     INSERT INTO nodes(root,path,parent,name,depth,directory,metadata,logical,allocated,total_logical,total_allocated,total_count,seen,modified_revision,total_revision)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
@@ -256,7 +257,10 @@ public actor DiskIndex {
                         total_logical=CASE WHEN excluded.directory=0 THEN excluded.logical ELSE nodes.total_logical END,
                         total_allocated=CASE WHEN excluded.directory=0 THEN excluded.allocated ELSE nodes.total_allocated END,
                         total_count=CASE WHEN excluded.directory=0 THEN 1 ELSE nodes.total_count END,
-                        modified_revision=CASE WHEN substr(nodes.metadata,1,120)<>substr(excluded.metadata,1,120) OR substr(nodes.metadata,137)<>substr(excluded.metadata,137) THEN excluded.modified_revision ELSE nodes.modified_revision END,
+                        modified_revision=CASE WHEN substr(nodes.metadata,1,24)<>substr(excluded.metadata,1,24)
+                            OR (excluded.directory=0 AND substr(nodes.metadata,25,8)<>substr(excluded.metadata,25,8))
+                            OR substr(nodes.metadata,33,88)<>substr(excluded.metadata,33,88)
+                            OR substr(nodes.metadata,137)<>substr(excluded.metadata,137) THEN excluded.modified_revision ELSE nodes.modified_revision END,
                         total_revision=CASE WHEN excluded.directory=0 AND (substr(nodes.metadata,1,120)<>substr(excluded.metadata,1,120) OR substr(nodes.metadata,137)<>substr(excluded.metadata,137)) THEN excluded.total_revision ELSE nodes.total_revision END
                     """)
                 let markDirty: Statement = try db.makeStatement(sql: "INSERT OR IGNORE INTO dirty(path,depth) VALUES(?,?)")

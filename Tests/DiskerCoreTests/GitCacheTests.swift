@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 import Testing
 @testable import DiskerCore
 
@@ -19,7 +20,8 @@ private func runFixtureGit(_ arguments: [String], at root: URL) throws {
 
 @Suite(.serialized)
 struct GitCacheTests {
-    @Test func gitEnrichmentPersistsAndInvalidatesAfterFilesystemRefresh() async throws {
+    @Test(arguments: [FileKind.directory, .regularFile])
+    func gitEnrichmentPersistsAndInvalidatesAfterFilesystemRefresh(linkCountKind: FileKind) async throws {
         let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let root: URL = fixture.appendingPathComponent("repo")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -41,9 +43,17 @@ struct GitCacheTests {
         let reopened: DiskIndex = try DiskIndex(databaseURL: cache)
         let persisted: CachedGitInfo = try #require(try await reopened.gitInfo(root: root.path, path: root.path, inspector: inspector))
         #expect(persisted.wasCached)
+        let connection: DatabaseQueue = try DatabaseQueue(path: cache.path)
+        let metadataPath: Data = Data((linkCountKind == .directory ? root.appendingPathComponent(".git/objects") : file).path.utf8)
+        try await connection.write { db in
+            var metadata: Data = try #require(try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE path=?", arguments: [metadataPath]))
+            var differentLinkCount: UInt64 = UInt64(try decodeMetadata(metadata).linkCount + 1).littleEndian
+            withUnsafeBytes(of: &differentLinkCount) { metadata.replaceSubrange(24..<32, with: $0) }
+            try db.execute(sql: "UPDATE nodes SET metadata=? WHERE path=?", arguments: [metadata, metadataPath])
+        }
         _ = try await reopened.refresh(root: root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
         let unchanged: CachedGitInfo = try #require(try await reopened.gitInfo(root: root.path, path: root.path, inspector: inspector))
-        #expect(unchanged.wasCached)
+        #expect(unchanged.wasCached == (linkCountKind == .directory), "Directory link counts may vary between APFS metadata queries; file link changes still invalidate the cache")
         try Data("changed source without changing HEAD or index".utf8).write(to: file)
         _ = try await reopened.refresh(root: root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
         let edited: CachedGitInfo = try #require(try await reopened.gitInfo(root: root.path, path: root.path, inspector: inspector))
