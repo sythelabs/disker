@@ -84,6 +84,13 @@ final class PendingScan: Sendable {
                     if bytes != rootPath { try invalidate(db: db, path: pendingParent(bytes)) }
                 }
                 for path: String in replay.dirtyDirectories { try invalidate(db: db, path: Data(path.utf8)) }
+                let retryPaths: [Data] = try Data.fetchAll(db, sql: """
+                    SELECT path FROM jobs WHERE root=? AND done=1 AND EXISTS(
+                        SELECT 1 FROM json_each(CAST(jobs.report AS TEXT),'$.issues')
+                        WHERE json_extract(value,'$.kind') IN
+                            ('permissionDenied','vanished','metadataUnavailable','ioError','changedDuringScan'))
+                    """, arguments: [root])
+                for path: Data in retryPaths { try invalidate(db: db, path: path) }
                 try db.execute(sql: "UPDATE scans SET checkpoint=? WHERE root=?", arguments: [try replay.checkpoint.map { try JSONEncoder().encode($0) }, root])
             }
         }
