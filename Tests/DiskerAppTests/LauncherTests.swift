@@ -1,9 +1,11 @@
+import AppKit
 import Foundation
 import Testing
+@testable import Disker
 
 @Suite("Development launcher")
 struct LauncherTests {
-    @Test func rebundlingReplacesReadOnlyResourcesAndRemovesObsoleteFiles() throws {
+    @Test @MainActor func rebundlingReplacesReadOnlyResourcesAndRemovesObsoleteFiles() throws {
         let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-bundle-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
         defer {
@@ -67,6 +69,31 @@ struct LauncherTests {
         #expect(FileManager.default.isExecutableFile(atPath: embedded.path))
         #expect(try String(contentsOf: embedded, encoding: .utf8) == "framework")
         #expect(try String(contentsOf: fixture.appendingPathComponent(".build/Disker.app/Contents/Resources/Sparkle-LICENSE.txt"), encoding: .utf8) == "license")
+        let appBundle: Bundle = try #require(Bundle(url: fixture.appendingPathComponent(".build/Disker.app")))
+        let mouse: NSImage = try loadOnboardingMouse(bundle: appBundle)
+        #expect(mouse.size.width == 1024)
+        #expect(mouse.size.height == 1024)
+    }
+
+    @Test @MainActor func mouseArtworkReportsMissingAndInvalidResources() throws {
+        let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-artwork-" + UUID().uuidString + ".bundle")
+        let resources: URL = fixture.appendingPathComponent("Contents/Resources")
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: fixture) }
+            catch { Issue.record(error) }
+        }
+        let info: Data = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "com.disker.artwork-tests", "CFBundlePackageType": "BNDL"], format: .xml, options: 0)
+        try info.write(to: fixture.appendingPathComponent("Contents/Info.plist"))
+        let bundle: Bundle = try #require(Bundle(url: fixture))
+        #expect(throws: OnboardingArtworkError.missingResource) { try loadOnboardingMouse(bundle: bundle) }
+        let invalidFixture: URL = fixture.appendingPathComponent("Invalid.bundle")
+        let invalid: URL = invalidFixture.appendingPathComponent("Contents/Resources/DiskerMouse.png")
+        try FileManager.default.createDirectory(at: invalid.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try info.write(to: invalidFixture.appendingPathComponent("Contents/Info.plist"))
+        try Data("invalid image".utf8).write(to: invalid)
+        let invalidBundle: Bundle = try #require(Bundle(url: invalidFixture))
+        #expect(throws: OnboardingArtworkError.unreadableResource(invalid.path)) { try loadOnboardingMouse(bundle: invalidBundle) }
     }
 
     @Test func runRequestsAFreshApplicationInstance() throws {

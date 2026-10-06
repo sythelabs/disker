@@ -89,7 +89,7 @@ final class DiskTreeModel {
     private(set) var scanStopped: Bool = false
     private(set) var expanded: Set<Data>
     private(set) var loading: Set<Data> = []
-    var sortOrder: [DiskTreeSort] = [DiskTreeSort(sort: NodeSort(column: .allocatedSize, order: .reverse))]
+    var sortOrder: [DiskTreeSort] = [DiskTreeSort(sort: NodeSort(column: .sizeProportion, order: .reverse))]
     private var rootNode: IndexedNode?
     private var pages: [Data: ChildPage] = [:]
     private var loadedSort: NodeSort?
