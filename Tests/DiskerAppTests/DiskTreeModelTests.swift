@@ -68,6 +68,77 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
 
 @Suite("Disk tree model", .serialized)
 @MainActor struct DiskTreeModelTests {
+    @Test(arguments: [(0, 1), (0, 510), (510, 510)])
+    func foldersExpandBeforeTheInitialScanCommits(rootFileCount: Int, folderFileCount: Int) async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let folder: URL = fixture.root.appendingPathComponent("folder")
+        let nested: URL = folder.appendingPathComponent("nested")
+        try treeFiles(directory: folder, count: folderFileCount, bytes: 4_096)
+        try treeFiles(directory: nested, count: 1, bytes: 8_192)
+        try treeFiles(directory: fixture.root.appendingPathComponent("padding"), count: 600, bytes: 1)
+        try treeFiles(directory: fixture.root, count: rootFileCount, bytes: 1)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let paused: Mutex<Bool> = Mutex(false)
+        defer { release.signal() }
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            guard case .batch = event else { return }
+            let shouldPause: Bool = paused.withLock { state in
+                if state { return false }
+                state = true
+                return true
+            }
+            if shouldPause, release.wait(timeout: .now() + 10) == .timedOut {
+                Issue.record("Timed out releasing initial tree scan")
+            }
+        })
+        await model.start()
+        let folderPath: Data = Data(folder.path.utf8)
+        let nestedPath: Data = Data(nested.path.utf8)
+        let rootPath: Data = Data(fixture.root.path.utf8)
+        let deadline: Date = Date().addingTimeInterval(5)
+        while model.rows.isEmpty && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(!model.rows.isEmpty)
+        if rootFileCount > 500 {
+            #expect(model.rows.contains { $0.id == .more(rootPath) })
+            await model.loadMore(rootPath)
+            #expect(model.rows.filter { $0.node?.entry.parentPath == rootPath }.count == rootFileCount + 2)
+        }
+        try #require(model.rows.contains { $0.id == .node(folderPath) })
+        #expect(model.isScanning)
+        #expect(model.summary == nil)
+        await model.toggle(folderPath)
+        #expect(model.expanded.contains(folderPath))
+        #expect(model.rows.contains { $0.id == .node(Data(folder.appendingPathComponent("file-0").path.utf8)) }, "Expanding a visible folder during the initial scan shows no children")
+        #expect(model.rows.filter { $0.node?.entry.parentPath == folderPath }.count == min(500, folderFileCount + 1))
+        if folderFileCount > 500 {
+            #expect(model.rows.contains { $0.id == .more(folderPath) })
+            await model.loadMore(folderPath)
+            #expect(model.rows.filter { $0.node?.entry.parentPath == folderPath }.count == folderFileCount + 1)
+            #expect(!model.rows.contains { $0.id == .more(folderPath) })
+        }
+        #expect(model.rows.contains { $0.id == .node(nestedPath) })
+        await model.toggle(nestedPath)
+        let nestedFile: DiskTreeRowID = .node(Data(nested.appendingPathComponent("file-0").path.utf8))
+        #expect(model.rows.contains { $0.id == nestedFile })
+        #expect(model.summary == nil)
+        let visibleIDs: [DiskTreeRowID] = model.rows.map(\.id)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(model.rows.map(\.id) == visibleIDs, "Scan preview updates must retain expanded branches and loaded pages")
+        #expect(Set(visibleIDs).count == visibleIDs.count)
+        await model.toggle(folderPath)
+        #expect(!model.rows.contains { $0.id == nestedFile })
+        await model.toggle(folderPath)
+        if folderFileCount > 500 { await model.loadMore(folderPath) }
+        #expect(model.rows.contains { $0.id == nestedFile })
+        release.signal()
+        try await waitForTreeScan(model)
+        #expect(model.rows.contains { $0.id == nestedFile })
+        #expect(model.errorMessage == nil)
+    }
+
     @Test func columnSortingPreservesExpandedHierarchyAndRefreshOrder() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
