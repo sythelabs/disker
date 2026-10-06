@@ -11,6 +11,7 @@ release:
 
 [private]
 _bundle binary:
+    rm -rf .build/Disker.app
     mkdir -p .build/Disker.app/Contents/MacOS .build/Disker.app/Contents/Resources
     cp "$1" .build/Disker.app/Contents/MacOS/Disker
     cp Info.plist .build/Disker.app/Contents/Info.plist
