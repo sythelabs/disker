@@ -36,6 +36,10 @@ jobs:
           plutil -lint .build/Disker.app/Contents/Info.plist
           test -f .build/Disker.app/Contents/Resources/GRDB_GRDB.bundle/Contents/Resources/PrivacyInfo.xcprivacy
           lipo .build/Disker.app/Contents/MacOS/Disker -verify_arch arm64 x86_64
+          lipo .build/Disker.app/Contents/Frameworks/Sparkle.framework/Sparkle -verify_arch arm64 x86_64
+          test -x .build/Disker.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate
+          test -s .build/Disker.app/Contents/Resources/Sparkle-LICENSE.txt
+          otool -l .build/Disker.app/Contents/MacOS/Disker | grep -F '@executable_path/../Frameworks'
           codesign --verify --deep --strict --verbose=2 .build/Disker.app
       - name: Package the app
         id: package
@@ -46,6 +50,40 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent .build/Disker.app "dist/Disker-$version-macOS-universal.zip"
           cd dist
           shasum -a 256 Disker-*.zip > SHA256SUMS.txt
+      - name: Sign and verify the update feed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          test -n "$SPARKLE_PRIVATE_KEY"
+          tools=.build/artifacts/sparkle/Sparkle/bin
+          printf '%s\n' "$SPARKLE_PRIVATE_KEY" | "$tools/generate_appcast" --ed-key-file - \
+            --download-url-prefix "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/" dist
+          printf '%s\n' "$SPARKLE_PRIVATE_KEY" | "$tools/sign_update" --ed-key-file - --verify dist/appcast.xml
+          signature=$(python3 - <<'PY'
+          import os
+          import pathlib
+          import plistlib
+          import xml.etree.ElementTree as ET
+          info = plistlib.loads(pathlib.Path('.build/Disker.app/Contents/Info.plist').read_bytes())
+          namespace = {'sparkle': 'http://www.andymatuschak.org/xml-namespaces/sparkle'}
+          items = ET.parse('dist/appcast.xml').findall('./channel/item')
+          assert len(items) == 1, 'Expected exactly one release in the update feed'
+          item = items[0]
+          assert item.findtext('sparkle:version', namespaces=namespace) == info['CFBundleVersion']
+          assert item.findtext('sparkle:shortVersionString', namespaces=namespace) == info['CFBundleShortVersionString']
+          enclosure = item.find('enclosure')
+          archive = pathlib.Path('dist') / ('Disker-' + os.environ['VERSION'] + '-macOS-universal.zip')
+          assert enclosure.get('url') == 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/releases/download/v' + os.environ['VERSION'] + '/' + archive.name
+          assert int(enclosure.get('length')) == archive.stat().st_size
+          print(enclosure.attrib['{' + namespace['sparkle'] + '}edSignature'])
+          PY
+          )
+          printf '%s\n' "$SPARKLE_PRIVATE_KEY" | "$tools/sign_update" --ed-key-file - --verify \
+            "dist/Disker-$VERSION-macOS-universal.zip" "$signature"
+          cd dist
+          shasum -a 256 Disker-*.zip appcast.xml > SHA256SUMS.txt
       - uses: actions/upload-artifact@v7
         with:
           name: Disker-macOS-universal
@@ -74,5 +112,8 @@ jobs:
         run: |
           cd dist
           sha256sum --check SHA256SUMS.txt
-          gh release create "v$VERSION" Disker-*.zip SHA256SUMS.txt \
-            --target "$COMMIT_SHA" --title "Disker $VERSION" --generate-notes
+          test -s appcast.xml
+          gh release create "v$VERSION" Disker-*.zip appcast.xml SHA256SUMS.txt \
+            --target "$COMMIT_SHA" --title "Disker $VERSION" --generate-notes --draft
+          release_id=$(gh api "repos/$GH_REPO/releases/tags/v$VERSION" --jq '.id')
+          gh api --method PATCH "repos/$GH_REPO/releases/$release_id" -F draft=false -f make_latest=legacy --jq '.html_url'

@@ -20,6 +20,14 @@ struct LauncherTests {
         try Data("first".utf8).write(to: resource)
         try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: resource.path)
         try Data("executable".utf8).write(to: bin.appendingPathComponent("Disker"))
+        let framework: URL = fixture.appendingPathComponent(".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework")
+        let frameworkBinary: URL = framework.appendingPathComponent("Versions/B/Sparkle")
+        try FileManager.default.createDirectory(at: frameworkBinary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("license".utf8).write(to: fixture.appendingPathComponent(".build/artifacts/sparkle/Sparkle/LICENSE"))
+        try Data("framework".utf8).write(to: frameworkBinary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: frameworkBinary.path)
+        try FileManager.default.createSymbolicLink(atPath: framework.appendingPathComponent("Versions/Current").path, withDestinationPath: "B")
+        try FileManager.default.createSymbolicLink(atPath: framework.appendingPathComponent("Sparkle").path, withDestinationPath: "Versions/Current/Sparkle")
         let tools: URL = fixture.appendingPathComponent("tools")
         try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
         for (name, script): (String, String) in [
@@ -54,6 +62,11 @@ struct LauncherTests {
         let bundled: URL = fixture.appendingPathComponent(".build/Disker.app/Contents/Resources/Fixture.bundle/PrivacyInfo.xcprivacy")
         #expect(try String(contentsOf: bundled, encoding: .utf8) == "second")
         #expect(!FileManager.default.fileExists(atPath: obsolete.path))
+        let embedded: URL = fixture.appendingPathComponent(".build/Disker.app/Contents/Frameworks/Sparkle.framework/Sparkle")
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: embedded.path) == "Versions/Current/Sparkle")
+        #expect(FileManager.default.isExecutableFile(atPath: embedded.path))
+        #expect(try String(contentsOf: embedded, encoding: .utf8) == "framework")
+        #expect(try String(contentsOf: fixture.appendingPathComponent(".build/Disker.app/Contents/Resources/Sparkle-LICENSE.txt"), encoding: .utf8) == "license")
     }
 
     @Test func runRequestsAFreshApplicationInstance() throws {
