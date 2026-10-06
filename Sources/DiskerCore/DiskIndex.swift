@@ -7,6 +7,7 @@ public actor DiskIndex {
     private let pool: DatabasePool
     private let cacheDirectories: [Data]
     private let writerLockURL: URL
+    private let pendingScanURL: URL
 
     public nonisolated static func open(databaseURL: URL) async throws -> DiskIndex {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DiskIndex, any Error>) in
@@ -22,6 +23,7 @@ public actor DiskIndex {
         let resolvedDirectory: String = directory.resolvingSymlinksInPath().path
         cacheDirectories = [Data(directory.path.utf8), Data(resolvedDirectory.utf8), Data(try physicalDirectoryPath(resolvedDirectory).utf8)]
         let resolvedDatabase: URL = databaseURL.standardizedFileURL.resolvingSymlinksInPath()
+        pendingScanURL = resolvedDatabase.appendingPathExtension("scan")
         let lockDirectory: String = try physicalDirectoryPath(resolvedDatabase.deletingLastPathComponent().path)
         writerLockURL = URL(fileURLWithPath: lockDirectory, isDirectory: true).appendingPathComponent(resolvedDatabase.lastPathComponent + ".write-lock", isDirectory: false)
         var configuration: Configuration = Configuration()
@@ -205,14 +207,18 @@ public actor DiskIndex {
         let start: ContinuousClock.Instant = ContinuousClock.now
         let result: (summary: IndexSummary, progress: IndexProgress) = try await withCacheWriterLock(at: writerLockURL, isCancelled: isCancelled, onWait: { receiveEvent(.waitingForWriter) }) {
             receiveEvent(.writerAcquired)
-            return try await self.pool.write { db in
+            let pendingScan: PendingScan = try PendingScan(databaseURL: self.pendingScanURL, root: normalized)
+            let result: (summary: IndexSummary, progress: IndexProgress) = try await self.pool.write { db in
                 let cached: IndexSummary? = try loadSummary(db: db, root: normalized)
                 let revision: Int64 = (cached?.revision ?? 0) + 1
+                let rootMetadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(normalized.utf8))
+                let pendingCheckpoint: JournalCheckpoint? = try pendingScan.checkpoint(revision: revision, metadata: rootMetadata, options: options)
+                let hasPendingScan: Bool = try pendingScan.exists()
                 let checkpointData: Data? = try Data.fetchOne(db, sql: "SELECT checkpoint FROM roots WHERE root=?", arguments: [normalized])
                 let checkpoint: JournalCheckpoint? = try checkpointData.map { try JSONDecoder().decode(JournalCheckpoint.self, from: $0) }
                 let journal: FileEventJournal
                 do {
-                    journal = try FileEventJournal(rootPath: normalized, checkpoint: checkpoint, latency: 0.05)
+                    journal = try FileEventJournal(rootPath: normalized, checkpoint: hasPendingScan ? pendingCheckpoint : checkpoint, latency: 0.05)
                 } catch FileEventJournalError.filesystem(let operation, let path, let code) {
                     throw ScanError.systemCall(path: Data(path.utf8), operation: operation, errnoCode: code)
                 }
@@ -265,7 +271,7 @@ public actor DiskIndex {
                     """)
                 let markDirty: Statement = try db.makeStatement(sql: "INSERT OR IGNORE INTO dirty(path,depth) VALUES(?,?)")
                 let previousDirectory: Statement = try db.makeStatement(sql: "SELECT directory FROM nodes WHERE root=? AND path=?")
-                func apply(_ batch: [ScanEntry]) throws {
+                func persist(_ batch: [ScanEntry]) throws {
                     for entry: ScanEntry in batch {
                         let directory: Bool = entry.metadata.kind == .directory
                         let logical: UInt64 = directory ? 0 : entry.metadata.logicalBytes
@@ -284,6 +290,9 @@ public actor DiskIndex {
                         logicalObserved += logical
                         allocatedObserved += entry.metadata.allocatedBytes
                     }
+                }
+                func apply(_ batch: [ScanEntry]) throws {
+                    try persist(batch)
                     receiveEvent(.batch(batch))
                     publishProgress()
                 }
@@ -397,8 +406,23 @@ public actor DiskIndex {
                         }
                     }
                 }
-                if mode == .full || cached == nil || replay.requiresFullScan || rootChanged {
-                    try scanTree(Data(normalized.utf8), progressWeight: 0.95)
+                if mode == .full || cached == nil || replay.requiresFullScan || rootChanged || hasPendingScan {
+                    try pendingScan.prepare(revision: revision, metadata: rootMetadata, options: options, replay: replay)
+                    let staged: ScanSummary = try pendingScan.run(options: options, metadata: rootMetadata, previousNodeCount: cached?.nodeCount, start: start, receiveEvent: receiveEvent, isCancelled: isCancelled)
+                    let path: Data = Data(normalized.utf8)
+                    try resetSeen(db: db, root: normalized, path: path)
+                    try pendingScan.replay(isCancelled: isCancelled, receiveBatch: persist)
+                    metrics = staged.metrics
+                    issues = staged.issues
+                    for alias: ScanAlias in staged.aliases {
+                        try db.execute(sql: "INSERT INTO aliases(root,path,target,seen) VALUES(?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET target=excluded.target,seen=excluded.seen", arguments: [normalized, alias.aliasPath, alias.targetPath, revision])
+                    }
+                    try preserveUnreachable(db: db, root: normalized, issues: staged.issues, revision: revision)
+                    try markRemovedParents(db: db, root: normalized, path: path, revision: revision)
+                    try removeUnseen(db: db, root: normalized, path: path, revision: revision)
+                    try markAncestors(db: db, path: path, rootPath: path)
+                    completionFraction = 0.95
+                    publishProgress()
                 } else {
                     issues = cached?.issues ?? []
                     let directories: [Data]
@@ -446,6 +470,8 @@ public actor DiskIndex {
                 try db.execute(sql: "INSERT INTO roots(root,revision,summary,checkpoint) VALUES(?,?,?,?) ON CONFLICT(root) DO UPDATE SET revision=excluded.revision,summary=excluded.summary,checkpoint=excluded.checkpoint", arguments: [normalized, revision, try JSONEncoder().encode(summary), try currentCheckpoint.map { try JSONEncoder().encode($0) }])
                 return (summary: summary, progress: IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsedSeconds(start), previousNodeCount: cached?.nodeCount, completionFraction: 1))
             }
+            try pendingScan.discard()
+            return result
         }
         receiveEvent(.progress(result.progress))
         receiveEvent(.completed(result.summary))
