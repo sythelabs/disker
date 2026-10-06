@@ -119,20 +119,21 @@ private struct JournalBufferState: Sendable {
     var requiresFullScan: Bool
     var eventID: UInt64
     var historyDone: Bool
+    var lastHistoryActivity: DispatchTime?
 }
 
-private final class JournalEventBuffer: Sendable {
+final class JournalEventBuffer: Sendable {
     let rootPath: String
     let relativePath: String
     let journalID: String?
-    let state: Mutex<JournalBufferState>
-    let historyFinished: DispatchSemaphore
+    private let state: Mutex<JournalBufferState>
+    private let historyFinished: DispatchSemaphore
 
     init(rootPath: String, relativePath: String, journalID: String?, eventID: UInt64, requiresFullScan: Bool, expectsHistory: Bool) {
         self.rootPath = rootPath
         self.relativePath = relativePath
         self.journalID = journalID
-        self.state = Mutex(JournalBufferState(dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: requiresFullScan, eventID: eventID, historyDone: !expectsHistory))
+        self.state = Mutex(JournalBufferState(dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: requiresFullScan, eventID: eventID, historyDone: !expectsHistory, lastHistoryActivity: nil))
         self.historyFinished = DispatchSemaphore(value: 0)
     }
 
@@ -170,6 +171,7 @@ private final class JournalEventBuffer: Sendable {
             state.recursiveDirectories.formUnion(scopes.recursiveDirectories)
             state.requiresFullScan = state.requiresFullScan || scopes.requiresFullScan || invalidPath
             state.eventID = max(state.eventID, latest)
+            if count > 0 && !state.historyDone { state.lastHistoryActivity = .now() }
             let shouldSignal: Bool = historyDone && !state.historyDone
             state.historyDone = state.historyDone || historyDone
             return shouldSignal
@@ -184,6 +186,24 @@ private final class JournalEventBuffer: Sendable {
             state.recursiveDirectories.removeAll(keepingCapacity: true)
             state.requiresFullScan = false
             return replay
+        }
+    }
+
+    func waitForHistory(timeout: TimeInterval, isCancelled: () -> Bool) throws {
+        let started: DispatchTime = .now()
+        while true {
+            if isCancelled() { throw ScanError.cancelled }
+            let deadline: DispatchTime? = try state.withLock { state in
+                if state.historyDone { return nil }
+                let activity: DispatchTime = state.lastHistoryActivity ?? started
+                let deadline: DispatchTime = DispatchTime(uptimeNanoseconds: max(activity.uptimeNanoseconds, started.uptimeNanoseconds)) + timeout
+                guard DispatchTime.now() < deadline else {
+                    throw FileEventJournalError.replayTimedOut(path: rootPath, timeout: timeout)
+                }
+                return deadline
+            }
+            guard let deadline: DispatchTime else { return }
+            _ = historyFinished.wait(timeout: min(deadline, .now() + 0.1))
         }
     }
 }
@@ -224,12 +244,10 @@ public final class FileEventJournal {
 
     deinit { stop() }
 
-    public func replay(timeout: TimeInterval) throws -> JournalReplay {
+    /// The timeout bounds inactivity while waiting for all historical events.
+    public func replay(timeout: TimeInterval, isCancelled: () -> Bool) throws -> JournalReplay {
         guard stream != nil else { throw FileEventJournalError.stopped(rootPath) }
-        let complete: Bool = buffer.state.withLock { $0.historyDone }
-        if !complete && buffer.historyFinished.wait(timeout: .now() + timeout) == .timedOut {
-            throw FileEventJournalError.replayTimedOut(path: rootPath, timeout: timeout)
-        }
+        try buffer.waitForHistory(timeout: timeout, isCancelled: isCancelled)
         return try drain()
     }
 

@@ -1,5 +1,6 @@
 import CoreServices
 import Foundation
+import Synchronization
 import Testing
 @testable import DiskerCore
 
@@ -11,8 +12,97 @@ private func removeJournalFixture(_ root: URL) {
     }
 }
 
+private func deliverJournalEvent(to buffer: JournalEventBuffer, flags: UInt32, eventID: UInt64) {
+    "fixture/file".withCString { path in
+        var pointer: UnsafePointer<CChar> = path
+        var eventFlags: UInt32 = flags
+        var identifier: UInt64 = eventID
+        withUnsafeMutablePointer(to: &pointer) { paths in
+            buffer.receive(count: 1, paths: UnsafeMutableRawPointer(paths), flags: &eventFlags, identifiers: &identifier)
+        }
+    }
+}
+
 @Suite("File event journal", .serialized)
 struct FileEventJournalTests {
+    @Test(arguments: [Array(UInt64(11)...25), [UInt64](repeating: 25, count: 15), Array((UInt64(11)...25).reversed())])
+    func activeHistoryReplayCanExceedItsInactivityTimeout(eventIDs: [UInt64]) throws {
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: true)
+        let finished: DispatchSemaphore = DispatchSemaphore(value: 0)
+        DispatchQueue(label: "DiskerTests.JournalHistory").async {
+            defer { finished.signal() }
+            for eventID: UInt64 in eventIDs {
+                deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified), eventID: eventID)
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagHistoryDone), eventID: 25)
+        }
+        defer { finished.wait() }
+        let start: ContinuousClock.Instant = ContinuousClock.now
+        try buffer.waitForHistory(timeout: 0.1, isCancelled: { false })
+        #expect(start.duration(to: .now) >= .milliseconds(200))
+        let replay: JournalReplay = buffer.snapshot()
+        #expect(replay.dirtyDirectories == ["/fixture"])
+        #expect(replay.checkpoint == JournalCheckpoint(journalID: "journal", eventID: 25))
+        #expect(!replay.requiresFullScan)
+    }
+
+    @Test(arguments: [false, true])
+    func stalledHistoryReplayStillTimesOut(afterActivity: Bool) throws {
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: true)
+        if afterActivity {
+            deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagItemIsFile), eventID: 11)
+        }
+        do {
+            try buffer.waitForHistory(timeout: 0.02, isCancelled: { false })
+            Issue.record("Incomplete journal replay returned without HistoryDone")
+        } catch FileEventJournalError.replayTimedOut(let path, let timeout) {
+            #expect(path == "/fixture")
+            #expect(timeout == 0.02)
+        }
+        deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagHistoryDone), eventID: 11)
+        try buffer.waitForHistory(timeout: 0.02, isCancelled: { false })
+    }
+
+    @Test(arguments: [false, true])
+    func waitingForHistoryCanBeCancelled(whileReceivingEvents: Bool) throws {
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: true)
+        let cancelled: Mutex<Bool> = Mutex(false)
+        let finished: DispatchSemaphore = DispatchSemaphore(value: 0)
+        DispatchQueue(label: "DiskerTests.JournalCancellation").async {
+            defer { finished.signal() }
+            for eventID: UInt64 in 11...13 {
+                if whileReceivingEvents {
+                    deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagItemIsFile), eventID: eventID)
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            cancelled.withLock { $0 = true }
+        }
+        defer { finished.wait() }
+        let start: ContinuousClock.Instant = .now
+        #expect(throws: ScanError.cancelled) {
+            try buffer.waitForHistory(timeout: 5, isCancelled: { cancelled.withLock { $0 } })
+        }
+        #expect(start.duration(to: .now) < .seconds(1))
+    }
+
+    @Test func streamsWithoutHistoryReturnImmediately() throws {
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: nil, eventID: 0, requiresFullScan: true, expectsHistory: false)
+        try buffer.waitForHistory(timeout: 0, isCancelled: { false })
+        #expect(buffer.snapshot().requiresFullScan)
+    }
+
+    @Test func historyCompletionPreservesDroppedEventInvalidation() throws {
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: true)
+        deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagMustScanSubDirs), eventID: 11)
+        deliverJournalEvent(to: buffer, flags: UInt32(kFSEventStreamEventFlagHistoryDone), eventID: 12)
+        try buffer.waitForHistory(timeout: 0.01, isCancelled: { false })
+        let replay: JournalReplay = buffer.snapshot()
+        #expect(replay.requiresFullScan)
+        #expect(replay.checkpoint == JournalCheckpoint(journalID: "journal", eventID: 12))
+    }
+
     @Test func eventFlagsChooseSafeReconciliationScopes() {
         let root: String = "/fixture"
         let file: JournalEvent = JournalEvent(path: "/fixture/a/file", flags: UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified), eventID: 12)
@@ -49,7 +139,7 @@ struct FileEventJournalTests {
     @Test func rootFilesystemRequiresScanInsteadOfSingleVolumeReplay() throws {
         let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: nil, latency: 0.01)
         defer { journal.stop() }
-        let replay: JournalReplay = try journal.replay(timeout: 5)
+        let replay: JournalReplay = try journal.replay(timeout: 5, isCancelled: { false })
         #expect(replay.requiresFullScan)
         #expect(replay.checkpoint == nil)
     }
@@ -63,7 +153,7 @@ struct FileEventJournalTests {
         try Data("old".utf8).write(to: modified)
         try Data("delete".utf8).write(to: deleted)
         let first: FileEventJournal = try FileEventJournal(rootPath: root.path, checkpoint: nil, latency: 0.01)
-        _ = try first.replay(timeout: 5)
+        _ = try first.replay(timeout: 5, isCancelled: { false })
         let checkpoint: JournalCheckpoint = try #require(try first.drain().checkpoint)
         first.stop()
 
@@ -73,7 +163,7 @@ struct FileEventJournalTests {
         let restarted: FileEventJournal = try FileEventJournal(rootPath: root.path, checkpoint: checkpoint, latency: 0.01)
         defer { restarted.stop() }
         let deadline: Date = Date().addingTimeInterval(5)
-        var replay: JournalReplay = try restarted.replay(timeout: 5)
+        var replay: JournalReplay = try restarted.replay(timeout: 5, isCancelled: { false })
         while !replay.dirtyDirectories.contains(root.path) && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.01)
             replay = try restarted.drain()
@@ -93,7 +183,7 @@ struct FileEventJournalTests {
         let deadline: Date = Date().addingTimeInterval(5)
         while Date() < deadline {
             let journal: FileEventJournal = try FileEventJournal(rootPath: root.path, checkpoint: checkpoint, latency: 0.01)
-            let replay: JournalReplay = try journal.replay(timeout: 5)
+            let replay: JournalReplay = try journal.replay(timeout: 5, isCancelled: { false })
             let committed: JournalCheckpoint = try #require(replay.checkpoint)
             checkpoint = committed
             journal.stop()
@@ -112,7 +202,7 @@ struct FileEventJournalTests {
         defer { removeJournalFixture(root) }
         let journal: FileEventJournal = try FileEventJournal(rootPath: root.path, checkpoint: JournalCheckpoint(journalID: "different", eventID: 1), latency: 0.01)
         defer { journal.stop() }
-        #expect(try journal.replay(timeout: 5).requiresFullScan)
+        #expect(try journal.replay(timeout: 5, isCancelled: { false }).requiresFullScan)
     }
 
     @Test func drainIncludesChangesMadeWhileScanWouldBeRunning() throws {
@@ -121,7 +211,7 @@ struct FileEventJournalTests {
         defer { removeJournalFixture(root) }
         let journal: FileEventJournal = try FileEventJournal(rootPath: root.path, checkpoint: nil, latency: 0.01)
         defer { journal.stop() }
-        _ = try journal.replay(timeout: 5)
+        _ = try journal.replay(timeout: 5, isCancelled: { false })
         try Data("written during scan".utf8).write(to: root.appendingPathComponent("racing-file"))
         let deadline: Date = Date().addingTimeInterval(5)
         var drained: JournalReplay = try journal.drain()

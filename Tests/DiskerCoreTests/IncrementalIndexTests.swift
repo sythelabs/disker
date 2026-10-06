@@ -51,7 +51,7 @@ private func createIncrementalFiles(directory: URL, count: Int, bytes: Int) thro
 private func mutateAfterJournalFence(root: URL, requiredDirectories: [String], mutate: () throws -> Void) throws {
     let journal: FileEventJournal = try FileEventJournal(rootPath: root.path, checkpoint: nil, latency: 0.01)
     defer { journal.stop() }
-    let before: JournalReplay = try journal.replay(timeout: 5)
+    let before: JournalReplay = try journal.replay(timeout: 5, isCancelled: { false })
     try mutate()
     var seen: Set<String> = []
     var recursive: Set<String> = []
@@ -575,7 +575,7 @@ struct IncrementalIndexTests {
         try createIncrementalFiles(directory: fixture.root, count: 1_200, bytes: 1)
         let observer: Mutex<FileEventJournal> = Mutex(try FileEventJournal(rootPath: fixture.root.path, checkpoint: nil, latency: 0.01))
         defer { observer.withLock { $0.stop() } }
-        let baseline: UInt64 = try observer.withLock { try $0.replay(timeout: 5).checkpoint?.eventID ?? 0 }
+        let baseline: UInt64 = try observer.withLock { try $0.replay(timeout: 5, isCancelled: { false }).checkpoint?.eventID ?? 0 }
         let state: Mutex<IncrementalCallbackState> = Mutex(IncrementalCallbackState(removedPath: nil, events: []))
         let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
         let summary: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in

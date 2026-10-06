@@ -74,7 +74,7 @@ func replacingAliasedDirectoryWithFileRemovesObsoleteAliases(replacementName: St
     }
     let journal: FileEventJournal = try FileEventJournal(rootPath: root.path, checkpoint: nil, latency: 0.01)
     defer { journal.stop() }
-    let before: JournalReplay = try journal.replay(timeout: 5)
+    let before: JournalReplay = try journal.replay(timeout: 5, isCancelled: { false })
     let replaced: URL = root.appendingPathComponent(replacementName)
     try FileManager.default.removeItem(at: replaced)
     try Data(repeating: 2, count: 3).write(to: replaced)
