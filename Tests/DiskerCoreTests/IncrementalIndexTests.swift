@@ -98,6 +98,76 @@ private func waitForIncrementalSignal(_ semaphore: DispatchSemaphore, timeout: D
 
 @Suite("Incremental index", .serialized)
 struct IncrementalIndexTests {
+    @Test(arguments: [ScanIssueKind.vanished, .metadataUnavailable, .ioError, .changedDuringScan])
+    func resumedScanRetriesFailedDirectoryReportsWithoutRepeatingSuccessfulBranches(kind: ScanIssueKind) throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let branch: URL = fixture.root.appendingPathComponent("a")
+        try createIncrementalFiles(directory: branch, count: 1, bytes: 3)
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
+        let database: URL = fixture.container.appendingPathComponent("pending.sqlite")
+        let pending: PendingScan = try PendingScan(databaseURL: database, root: fixture.root.path)
+        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
+        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
+        let replay: JournalReplay = JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false)
+        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
+        _ = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
+            receiveEvent: { _ in }, isCancelled: { false })
+        let report: ScanSummary = ScanSummary(metrics: ScanMetrics(entries: 0, directories: 0, bulkCalls: 0, metadataCalls: 0, contentBytesRead: 0),
+            issues: [ScanIssue(kind: kind, path: Data(branch.path.utf8), operation: "fixture", errnoCode: EIO)], aliases: [])
+        let writer: DatabaseQueue = try DatabaseQueue(path: database.path)
+        try writer.write { db in
+            try db.execute(sql: "UPDATE jobs SET report=? WHERE root=? AND path=?", arguments: [try JSONEncoder().encode(report), fixture.root.path, Data(branch.path.utf8)])
+        }
+        try Data(repeating: 2, count: 17).write(to: branch.appendingPathComponent("file-0"))
+        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
+        let summary: ScanSummary = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
+            receiveEvent: { _ in }, isCancelled: { false })
+        var entries: [ScanEntry] = []
+        try pending.replay(isCancelled: { false }) { entries += $0 }
+        #expect(summary.issues.isEmpty)
+        #expect(summary.metrics.entries == 2)
+        #expect(entries.count == 5)
+        #expect(entries.filter { $0.metadata.kind != .directory }.reduce(UInt64(0)) { $0 + $1.metadata.logicalBytes } == 22)
+    }
+
+    @Test func resumedScanRetriesPermissionGapsAfterAccessIsRestoredWithoutJournalEvents() throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        let branch: URL = fixture.root.appendingPathComponent("a")
+        defer {
+            do { try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: branch.path) }
+            catch { Issue.record(error) }
+            removeIncrementalFixture(fixture)
+        }
+        try createIncrementalFiles(directory: branch, count: 1, bytes: 3)
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: branch.path)
+        let pending: PendingScan = try PendingScan(databaseURL: fixture.container.appendingPathComponent("pending.sqlite"), root: fixture.root.path)
+        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
+        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
+        let replay: JournalReplay = JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false)
+        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
+        let cancelled: Mutex<Bool> = Mutex(false)
+        #expect(throws: ScanError.cancelled) {
+            try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
+                receiveEvent: { event in
+                    if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
+                }, isCancelled: { cancelled.withLock { $0 } })
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: branch.path)
+        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
+        let summary: ScanSummary = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
+            receiveEvent: { _ in }, isCancelled: { false })
+        var entries: [ScanEntry] = []
+        try pending.replay(isCancelled: { false }) { entries += $0 }
+        #expect(summary.issues.isEmpty)
+        #expect(entries.count == 5)
+        #expect(entries.contains { $0.path == Data(branch.appendingPathComponent("file-0").path.utf8) })
+        #expect(entries.filter { $0.metadata.kind != .directory }.reduce(UInt64(0)) { $0 + $1.metadata.logicalBytes } == 8)
+        // Restored preview batches precede new enumeration; metrics count only new work.
+        #expect(summary.metrics.entries == 4)
+    }
+
     @Test(arguments: RetryMutation.allCases)
     fileprivate func resumedDirtyDirectoryRemovedOrReplacedDropsItsOldDescendants(mutation: RetryMutation) throws {
         let fixture: IncrementalFixture = try incrementalFixture()
