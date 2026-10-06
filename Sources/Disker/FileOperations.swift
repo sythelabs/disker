@@ -20,7 +20,7 @@ struct FileItem: Identifiable, Sendable {
 }
 
 struct FileChange: Sendable {
-    let removedURL: URL?
+    let removedURLs: [URL]
     let insertedURL: URL?
 }
 
@@ -34,6 +34,7 @@ enum FileOperationError: Error, Equatable, LocalizedError, Sendable {
     case invalidDestination(URL)
     case pathNotUTF8(URL)
     case emptySelection
+    case trashFailed([URL], String)
 
     var errorDescription: String? {
         switch self {
@@ -45,8 +46,25 @@ enum FileOperationError: Error, Equatable, LocalizedError, Sendable {
         case .missingResult(let operation, let url): return "\(operation) returned no destination for \(url.path)."
         case .invalidDestination(let url): return "Cannot copy or move an item into itself: \(url.path)"
         case .pathNotUTF8(let url): return "This path cannot be represented as text: \(url.absoluteString)"
-        case .emptySelection: return "Select at least one file or folder to copy."
+        case .emptySelection: return "Select at least one file or folder."
+        case .trashFailed(let urls, let diagnostic): return "Move to Trash failed for \(urls.map(\.path).joined(separator: ", ")): \(diagnostic)"
         }
+    }
+}
+
+func trashTargets(_ items: [FileItem]) throws -> [FileItem] {
+    guard !items.isEmpty else { throw FileOperationError.emptySelection }
+    let directories: Set<Data> = Set(items.filter(\.isDirectory).map(\.id))
+    var seen: Set<Data> = []
+    return items.filter { item in
+        guard seen.insert(item.id).inserted else { return false }
+        var ancestor: Data = item.id
+        while ancestor.count > 1, let separator: Data.Index = ancestor.lastIndex(of: 47) {
+            ancestor = Data(ancestor.prefix(upTo: separator))
+            if ancestor.isEmpty { ancestor = Data([47]) }
+            if directories.contains(ancestor) { return false }
+        }
+        return true
     }
 }
 
@@ -128,13 +146,19 @@ private func destinationURL(source: URL, directory: URL) throws -> URL {
         return try await duplicateURL(item.url)
     }
 
-    func trash(_ item: FileItem) async throws -> URL {
-        try await Task.detached(priority: .userInitiated) { try self.validate(item) }.value
+    func trash(_ items: [FileItem]) async throws -> [URL: URL] {
+        let targets: [FileItem] = try trashTargets(items)
+        try await Task.detached(priority: .userInitiated) {
+            for item: FileItem in targets { try self.validate(item) }
+        }.value
+        let urls: [URL] = targets.map(\.url)
         let results: [URL: URL]
-        do { results = try await NSWorkspace.shared.recycle([item.url]) }
-        catch { throw FileOperationError.failed("Move to Trash", item.url, String(describing: error)) }
-        guard let destination: URL = results[item.url] else { throw FileOperationError.missingResult("Move to Trash", item.url) }
-        return destination
+        do { results = try await NSWorkspace.shared.recycle(urls) }
+        catch { throw FileOperationError.trashFailed(urls, String(describing: error)) }
+        for url: URL in urls {
+            guard results[url] != nil else { throw FileOperationError.missingResult("Move to Trash", url) }
+        }
+        return results
     }
 
     nonisolated func rename(_ item: FileItem, to name: String) async throws -> URL {

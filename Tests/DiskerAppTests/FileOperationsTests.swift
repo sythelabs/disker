@@ -31,6 +31,52 @@ private func operationItem(path: Data, root: URL) throws -> FileItem {
 
 @Suite("File operations", .serialized)
 @MainActor struct FileOperationsTests {
+    @Test func trashSelectionValidatesEveryItemBeforeMovingAnyFile() async throws {
+        let fixture: FileOperationFixture = try operationFixture()
+        defer { removeOperationFixture(fixture) }
+        try Data("keep".utf8).write(to: fixture.source)
+        let staleURL: URL = fixture.root.appendingPathComponent("stale.txt")
+        try Data("original".utf8).write(to: staleURL)
+        let items: [FileItem] = try [fixture.source, staleURL].map { try operationItem(path: filePathBytes($0), root: fixture.root) }
+        try FileManager.default.moveItem(at: staleURL, to: fixture.root.appendingPathComponent("original.txt"))
+        try Data("replacement".utf8).write(to: staleURL)
+        await #expect(throws: FileOperationError.changedItem(items[1].id)) { try await FileOperations().trash(items) }
+        #expect(try Data(contentsOf: fixture.source) == Data("keep".utf8))
+        #expect(try Data(contentsOf: staleURL) == Data("replacement".utf8))
+    }
+
+    @Test func emptyTrashSelectionIsRejected() async throws {
+        await #expect(throws: FileOperationError.emptySelection) { try await FileOperations().trash([]) }
+    }
+
+    @Test(arguments: [false, true])
+    func trashSelectionMovesFilesAndFoldersWithoutSubmittingDescendantsTwice(childFirst: Bool) async throws {
+        let fixture: FileOperationFixture = try operationFixture()
+        defer { removeOperationFixture(fixture) }
+        let folder: URL = fixture.root.appendingPathComponent("folder")
+        let neighbor: URL = fixture.root.appendingPathComponent("folder-other")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let child: URL = folder.appendingPathComponent("child.txt")
+        try Data("child".utf8).write(to: child)
+        try Data("neighbor".utf8).write(to: neighbor)
+        try Data("file".utf8).write(to: fixture.source)
+        let paths: [URL] = childFirst ? [child, folder, fixture.source, neighbor, folder] : [folder, child, folder, neighbor, fixture.source]
+        let items: [FileItem] = try paths.map { try operationItem(path: filePathBytes($0), root: fixture.root) }
+        let results: [URL: URL] = try await FileOperations().trash(items)
+        defer {
+            for destination: URL in results.values {
+                do { try FileManager.default.removeItem(at: destination) }
+                catch { Issue.record(error) }
+            }
+        }
+        #expect(Set(results.keys) == Set([folder, neighbor, fixture.source]))
+        for source: URL in [folder, child, neighbor, fixture.source] { #expect(!FileManager.default.fileExists(atPath: source.path)) }
+        let trashedFolder: URL = try #require(results[folder])
+        #expect(try Data(contentsOf: trashedFolder.appendingPathComponent("child.txt")) == Data("child".utf8))
+        #expect(try Data(contentsOf: #require(results[neighbor])) == Data("neighbor".utf8))
+        #expect(try Data(contentsOf: #require(results[fixture.source])) == Data("file".utf8))
+    }
+
     @Test func multipleSelectionCopiesAllURLsAndEmptySelectionPreservesClipboard() throws {
         let fixture: FileOperationFixture = try operationFixture()
         defer { removeOperationFixture(fixture) }
