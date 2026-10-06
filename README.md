@@ -1,6 +1,12 @@
-# Disker
+<p align="center">
+  <img src="docs/images/app-icon.png" width="96" height="96" alt="Disker app icon">
+</p>
 
-Native SwiftUI disk usage app for macOS 26 and later, using Swift 6.2.
+<h1 align="center">Disker</h1>
+
+<p align="center">Native SwiftUI disk usage app for macOS 26 and later, using Swift 6.2.</p>
+
+![Disker browsing a sample folder with expanded folders, allocated sizes, and proportional bars](docs/images/disker.jpg)
 
 ## Download
 
