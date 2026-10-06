@@ -31,6 +31,22 @@ private func operationItem(path: Data, root: URL) throws -> FileItem {
 
 @Suite("File operations", .serialized)
 @MainActor struct FileOperationsTests {
+    @Test func multipleSelectionCopiesAllURLsAndEmptySelectionPreservesClipboard() throws {
+        let fixture: FileOperationFixture = try operationFixture()
+        defer { removeOperationFixture(fixture) }
+        try Data("first".utf8).write(to: fixture.source)
+        let second: URL = fixture.root.appendingPathComponent("second.txt")
+        try Data("second".utf8).write(to: second)
+        let items: [FileItem] = try [fixture.source, second].map { try operationItem(path: filePathBytes($0), root: fixture.root) }
+        let pasteboard: NSPasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let operations: FileOperations = FileOperations()
+        try operations.copy(items, to: pasteboard)
+        #expect(try operations.files(on: pasteboard) == [fixture.source, second])
+        #expect(throws: FileOperationError.emptySelection) { try operations.copy([], to: pasteboard) }
+        #expect(try operations.files(on: pasteboard) == [fixture.source, second])
+    }
+
     @Test func renamePreservesContentsAndRefusesToOverwriteAnotherFile() async throws {
         let fixture: FileOperationFixture = try operationFixture()
         defer { removeOperationFixture(fixture) }

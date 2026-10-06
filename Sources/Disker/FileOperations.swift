@@ -33,6 +33,7 @@ enum FileOperationError: Error, Equatable, LocalizedError, Sendable {
     case missingResult(String, URL)
     case invalidDestination(URL)
     case pathNotUTF8(URL)
+    case emptySelection
 
     var errorDescription: String? {
         switch self {
@@ -44,6 +45,7 @@ enum FileOperationError: Error, Equatable, LocalizedError, Sendable {
         case .missingResult(let operation, let url): return "\(operation) returned no destination for \(url.path)."
         case .invalidDestination(let url): return "Cannot copy or move an item into itself: \(url.path)"
         case .pathNotUTF8(let url): return "This path cannot be represented as text: \(url.absoluteString)"
+        case .emptySelection: return "Select at least one file or folder to copy."
         }
     }
 }
@@ -168,8 +170,13 @@ private func destinationURL(source: URL, directory: URL) throws -> URL {
     }
 
     func copy(_ item: FileItem, to pasteboard: NSPasteboard) throws {
+        try copy([item], to: pasteboard)
+    }
+
+    func copy(_ items: [FileItem], to pasteboard: NSPasteboard) throws {
+        guard let first: FileItem = items.first else { throw FileOperationError.emptySelection }
         pasteboard.clearContents()
-        guard pasteboard.writeObjects([item.url as NSURL]) else { throw FileOperationError.failed("Copy", item.url, "The clipboard rejected the file URL") }
+        guard pasteboard.writeObjects(items.map { $0.url as NSURL }) else { throw FileOperationError.failed("Copy", first.url, "The clipboard rejected the file URLs") }
     }
 
     func copyPath(_ item: FileItem, to pasteboard: NSPasteboard) throws {
