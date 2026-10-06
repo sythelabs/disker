@@ -28,6 +28,7 @@ _bundle binary:
     cp "$1" .build/Disker.app/Contents/MacOS/Disker
     cp Info.plist .build/Disker.app/Contents/Info.plist
     cp Resources/Credits.rtf .build/Disker.app/Contents/Resources/Credits.rtf
+    cp Resources/AppIcon.icon/Assets/Disker.png .build/Disker.app/Contents/Resources/DiskerMouse.png
     cp -R "$(dirname "$1")"/*.bundle .build/Disker.app/Contents/Resources/
     ditto .build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework .build/Disker.app/Contents/Frameworks/Sparkle.framework
     cp .build/artifacts/sparkle/Sparkle/LICENSE .build/Disker.app/Contents/Resources/Sparkle-LICENSE.txt

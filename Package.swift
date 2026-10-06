@@ -17,7 +17,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "Disker",
-            dependencies: ["DiskerCore", .product(name: "Sparkle", package: "Sparkle")],
+            dependencies: ["DiskerCore", .product(name: "GRDB", package: "GRDB.swift"), .product(name: "Sparkle", package: "Sparkle")],
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
         ),
         .target(name: "CDiskerScan", publicHeadersPath: "include"),
