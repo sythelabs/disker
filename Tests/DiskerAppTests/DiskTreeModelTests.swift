@@ -68,6 +68,47 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
 
 @Suite("Disk tree model", .serialized)
 @MainActor struct DiskTreeModelTests {
+    @Test(arguments: [NodeSortColumn.sizeProportion, .allocatedSize, .items])
+    func sortedInitialScanKeepsRowsInPlaceUntilCommit(column: NodeSortColumn) async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let first: URL = fixture.root.appendingPathComponent("a")
+        let second: URL = fixture.root.appendingPathComponent("b")
+        try treeFiles(directory: first, count: 1, bytes: 32_768)
+        try treeFiles(directory: second, count: 0, bytes: 0)
+        let arrived: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let batches: Mutex<Int> = Mutex(0)
+        defer { release.signal(); release.signal() }
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            guard case .batch = event else { return }
+            let number: Int = batches.withLock { count in count += 1; return count }
+            if number <= 2 {
+                arrived.signal()
+                if release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing sorted preview scan") }
+            }
+        })
+        await model.start()
+        try #require(await waitForTreeSignal(arrived, timeout: .now() + 5) == .success)
+        let root: Data = Data(fixture.root.path.utf8)
+        model.sortOrder = [DiskTreeSort(sort: NodeSort(column: column, order: .forward))]
+        await model.sort()
+        let initial: [DiskTreeRowID] = model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id)
+        try #require(initial.count == 2)
+        release.signal()
+        try #require(await waitForTreeSignal(arrived, timeout: .now() + 5) == .success)
+        let deadline: Date = Date().addingTimeInterval(5)
+        while (model.rows.first { $0.id == .node(Data(first.path.utf8)) }?.node?.subtreeLogicalBytes ?? 0) == 0 && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.rows.first { $0.id == .node(Data(first.path.utf8)) }?.node?.subtreeLogicalBytes == 32_768)
+        #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == initial, "Growing scan totals moved rows between clicks after selecting a sort column")
+        release.signal()
+        try await waitForTreeScan(model)
+        #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == [.node(Data(second.path.utf8)), .node(Data(first.path.utf8))])
+        #expect(model.errorMessage == nil)
+    }
+
     @Test func reopenedInitialScanRestoresVisibleBranchSizesAndProgress() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }

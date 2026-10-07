@@ -198,6 +198,10 @@ struct ContentView: View {
                     do { NSWorkspace.shared.activateFileViewerSelecting(try selectedItems(ids).map(\.url)) }
                     catch { fileOperationError = error.localizedDescription }
                 }
+                Divider()
+                Button("Move to Trash", systemImage: "trash", role: .destructive) { trashSelection(ids) }
+                    .keyboardShortcut(.delete, modifiers: .command)
+                    .disabled(operating)
             }
         } primaryAction: { ids in
             if ids.count == 1, case .more(let path) = ids.first { Task { await model.loadMore(path) } }
@@ -305,7 +309,7 @@ struct ContentView: View {
         pasteMenu(into: item.isDirectory ? item.url : item.url.deletingLastPathComponent())
         ShareLink("Share", item: item.url)
         Divider()
-        Button("Move to Trash", systemImage: "trash", role: .destructive) { trash(item) }
+        Button("Move to Trash", systemImage: "trash", role: .destructive) { trashSelection([.node(item.id)]) }
             .keyboardShortcut(.delete, modifiers: .command)
             .disabled(operating)
     }
@@ -362,22 +366,25 @@ struct ContentView: View {
     private func rename(_ item: FileItem, to name: String) {
         performMutation(in: [item.url.deletingLastPathComponent()]) {
             let destination: URL = try await operations.rename(item, to: name)
-            return FileChange(removedURL: item.url, insertedURL: destination)
+            return FileChange(removedURLs: [item.url], insertedURL: destination)
         }
     }
 
     private func duplicate(_ item: FileItem) {
         performMutation(in: [item.url.deletingLastPathComponent()]) {
             let destination: URL = try await operations.duplicate(item)
-            return FileChange(removedURL: nil, insertedURL: destination)
+            return FileChange(removedURLs: [], insertedURL: destination)
         }
     }
 
-    private func trash(_ item: FileItem) {
-        performMutation(in: [item.url.deletingLastPathComponent()]) {
-            _ = try await operations.trash(item)
-            return FileChange(removedURL: item.url, insertedURL: nil)
-        }
+    private func trashSelection(_ ids: Set<DiskTreeRowID>) {
+        do {
+            let items: [FileItem] = try trashTargets(selectedItems(ids))
+            performMutation(in: Array(Set(items.map { $0.url.deletingLastPathComponent() }))) {
+                let results: [URL: URL] = try await operations.trash(items)
+                return FileChange(removedURLs: Array(results.keys), insertedURL: nil)
+            }
+        } catch { fileOperationError = error.localizedDescription }
     }
 
     private func paste(into directory: URL) {
@@ -388,7 +395,7 @@ struct ContentView: View {
             var destination: URL?
             guard !sources.isEmpty else { throw FileOperationError.failed("Paste", directory, "No files on the clipboard") }
             for source: URL in sources { destination = try await operations.paste(source, into: directory) }
-            return FileChange(removedURL: nil, insertedURL: destination)
+            return FileChange(removedURLs: [], insertedURL: destination)
         }
     }
 
@@ -400,7 +407,7 @@ struct ContentView: View {
             var destination: URL?
             guard !sources.isEmpty else { throw FileOperationError.failed("Move", directory, "No files on the clipboard") }
             for source: URL in sources { destination = try await operations.move(source, into: directory) }
-            return FileChange(removedURL: sources.last, insertedURL: destination)
+            return FileChange(removedURLs: sources, insertedURL: destination)
         }
     }
 
@@ -414,21 +421,24 @@ struct ContentView: View {
             var change: FileChange?
             do { change = try await operation() }
             catch { fileOperationError = error.localizedDescription }
+            guard model.rootPath == originalRoot else { return }
             do {
                 let root: Data = Data(model.rootPath.utf8)
-                if let removed: URL = change?.removedURL, try filePathBytes(removed) == root {
+                if let removed: URL = try change?.removedURLs.first(where: { try filePathBytes($0) == root }) {
                     selection = []
                     await model.chooseRoot(change?.insertedURL ?? removed.deletingLastPathComponent())
                 } else {
                     let prefix: Data = root.last == 47 ? root : root + Data([47])
                     let paths: [Data] = try directories.map(filePathBytes).filter { $0 == root || $0.starts(with: prefix) }
                     if !paths.isEmpty { await model.refreshDirectories(paths) }
-                    if model.rootPath == originalRoot, selection == originalSelection {
+                    guard model.rootPath == originalRoot else { return }
+                    if selection == originalSelection {
                         if let inserted: URL = change?.insertedURL {
                             let id: DiskTreeRowID = .node(try filePathBytes(inserted))
                             if model.rows.contains(where: { $0.id == id }) { selection = [id] }
-                        } else if let removed: URL = change?.removedURL, selection.contains(.node(try filePathBytes(removed))) { selection = [] }
+                        }
                     }
+                    selection.formIntersection(Set(model.rows.map(\.id)))
                 }
             } catch { fileOperationError = error.localizedDescription }
         }
@@ -441,6 +451,12 @@ struct ContentView: View {
             if press.key == "v", press.modifiers == .command, selection.count <= 1, !operating, !clipboardItems.isEmpty { paste(into: destination); return .handled }
             if press.key == "v", press.modifiers == [.command, .option], selection.count <= 1, !operating, !clipboardItems.isEmpty { move(into: destination); return .handled }
             if press.key == "c", press.modifiers == .command, selection.count > 1 { copySelection(selection); return .handled }
+            // macOS Delete sends DEL (0x7f), while SwiftUI's .delete represents backspace (0x08).
+            if (press.key == .delete || press.key == KeyEquivalent("\u{7f}")), press.modifiers == .command, !operating,
+               selection.contains(where: { if case .node = $0 { return true }; return false }) {
+                trashSelection(selection)
+                return .handled
+            }
             guard let item else { return .ignored }
             if press.key == "o", press.modifiers == .command { open(item); return .handled }
             if press.key == .space, press.modifiers.isEmpty { previewURL = item.url; return .handled }
@@ -448,8 +464,6 @@ struct ContentView: View {
             if press.key == "c", press.modifiers == [.command, .option] { copyPath(item); return .handled }
             if press.key == .return, press.modifiers.isEmpty, !operating { renaming = item; return .handled }
             if press.key == "d", press.modifiers == .command, !operating { duplicate(item); return .handled }
-            // macOS Delete sends DEL (0x7f), while SwiftUI's .delete represents backspace (0x08).
-            if (press.key == .delete || press.key == KeyEquivalent("\u{7f}")), press.modifiers == .command, !operating { trash(item); return .handled }
             return .ignored
         } catch {
             fileOperationError = error.localizedDescription
@@ -529,6 +543,7 @@ struct SizeProportionBar: View {
             .tint(.accentColor)
             .accessibilityLabel("Share of parent folder")
             .accessibilityValue(proportion.formatted(.percent.precision(.fractionLength(1))))
+            .allowsHitTesting(false)
             .transaction { transaction in
                 transaction.animation = nil
                 transaction.disablesAnimations = true
