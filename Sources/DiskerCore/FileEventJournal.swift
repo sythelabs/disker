@@ -113,6 +113,37 @@ private func journalIdentity(rootPath: String) throws -> JournalIdentity {
     return JournalIdentity(device: metadata.st_dev, relativePath: relativePath, journalID: journalID)
 }
 
+private func hostJournalIdentity() throws -> String {
+    var length: Int = 0
+    guard sysctlbyname("kern.bootsessionuuid", nil, &length, nil, 0) == 0 else {
+        throw FileEventJournalError.filesystem(operation: "sysctl kern.bootsessionuuid", path: "/", code: errno)
+    }
+    var boot: [CChar] = [CChar](repeating: 0, count: length)
+    guard sysctlbyname("kern.bootsessionuuid", &boot, &length, nil, 0) == 0 else {
+        throw FileEventJournalError.filesystem(operation: "sysctl kern.bootsessionuuid", path: "/", code: errno)
+    }
+    let bootID: String? = boot.withUnsafeBufferPointer { String(validatingCString: $0.baseAddress!) }
+    guard let bootID else { throw FileEventJournalError.invalidPath("kern.bootsessionuuid") }
+    let count: Int32 = getfsstat(nil, 0, MNT_NOWAIT)
+    guard count >= 0 else { throw FileEventJournalError.filesystem(operation: "getfsstat", path: "/", code: errno) }
+    let initial: statfs = statfs()
+    var mounts: [statfs] = Array(repeating: initial, count: Int(count) + 16)
+    let read: Int32 = mounts.withUnsafeMutableBufferPointer { buffer in
+        getfsstat(buffer.baseAddress, Int32(buffer.count * MemoryLayout<statfs>.stride), MNT_NOWAIT)
+    }
+    guard read >= 0, read < mounts.count else { throw FileEventJournalError.filesystem(operation: "getfsstat topology", path: "/", code: errno) }
+    let volumes: [String] = mounts.prefix(Int(read)).map { filesystem in
+        var value: statfs = filesystem
+        let device: Int32 = value.f_fsid.val.0
+        let uuid: String = FSEventsCopyUUIDForDevice(device).map { CFUUIDCreateString(nil, $0) as String } ?? "unavailable"
+        let mount: String = withUnsafePointer(to: &value.f_mntonname) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        }
+        return "\(device):\(uuid):\(mount)"
+    }
+    return "host:\(bootID):" + volumes.sorted().joined(separator: "|")
+}
+
 private struct JournalBufferState: Sendable {
     var dirtyDirectories: Set<String>
     var recursiveDirectories: Set<String>
@@ -218,8 +249,9 @@ public final class FileEventJournal {
     public init(rootPath: String, checkpoint: JournalCheckpoint?, latency: TimeInterval) throws {
         let normalizedRoot: String = URL(fileURLWithPath: rootPath).standardizedFileURL.path
         let identity: JournalIdentity = try journalIdentity(rootPath: normalizedRoot)
-        let durableJournalID: String? = normalizedRoot == "/" ? nil : identity.journalID
-        let current: UInt64 = FSEventsGetLastEventIdForDeviceBeforeTime(identity.device, Date().timeIntervalSince1970)
+        let host: Bool = normalizedRoot == "/"
+        let durableJournalID: String? = host ? try hostJournalIdentity() : identity.journalID
+        let current: UInt64 = host ? FSEventsGetCurrentEventId() : FSEventsGetLastEventIdForDeviceBeforeTime(identity.device, Date().timeIntervalSince1970)
         let checkpointMatches: Bool = checkpoint != nil && checkpoint?.journalID == durableJournalID && checkpoint!.eventID < UInt64(kFSEventStreamEventIdSinceNow) && checkpoint!.eventID <= FSEventsGetCurrentEventId()
         let since: UInt64 = durableJournalID == nil ? UInt64(kFSEventStreamEventIdSinceNow) : (checkpointMatches ? checkpoint!.eventID : current)
         self.rootPath = normalizedRoot
@@ -231,7 +263,10 @@ public final class FileEventJournal {
             Unmanaged<JournalEventBuffer>.fromOpaque(context).takeUnretainedValue().receive(count: count, paths: paths, flags: flags, identifiers: identifiers)
         }
         let flags: FSEventStreamCreateFlags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot | kFSEventStreamCreateFlagNoDefer)
-        guard let stream: FSEventStreamRef = FSEventStreamCreateRelativeToDevice(nil, callback, &context, identity.device, [identity.relativePath] as CFArray, since, latency, flags) else { throw FileEventJournalError.streamCreation(normalizedRoot) }
+        let created: FSEventStreamRef? = host
+            ? FSEventStreamCreate(nil, callback, &context, ["/"] as CFArray, since, latency, flags)
+            : FSEventStreamCreateRelativeToDevice(nil, callback, &context, identity.device, [identity.relativePath] as CFArray, since, latency, flags)
+        guard let stream: FSEventStreamRef = created else { throw FileEventJournalError.streamCreation(normalizedRoot) }
         self.stream = stream
         FSEventStreamSetDispatchQueue(stream, queue)
         guard FSEventStreamStart(stream) else {

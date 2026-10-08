@@ -6,7 +6,7 @@ import Testing
 @Suite("Writer waiting status")
 struct WriterWaitingTests {
     @Test func waitingStatusClearsWhenWriterIsAcquired() {
-        let buffer: TreeScanBuffer = TreeScanBuffer(root: Data("/fixture".utf8), capturePreview: false, limit: 500)
+        let buffer: TreeScanBuffer = TreeScanBuffer()
         buffer.receive(.started(cached: nil))
         #expect(!buffer.snapshot().isWaitingForWriter)
         buffer.receive(.waitingForWriter)
@@ -16,7 +16,7 @@ struct WriterWaitingTests {
     }
 
     @Test func cancellationClearsWaitingStatusAndRejectsLateWaitingEvents() {
-        let buffer: TreeScanBuffer = TreeScanBuffer(root: Data("/fixture".utf8), capturePreview: false, limit: 500)
+        let buffer: TreeScanBuffer = TreeScanBuffer()
         buffer.receive(.waitingForWriter)
         #expect(buffer.snapshot().isWaitingForWriter)
         buffer.cancel()

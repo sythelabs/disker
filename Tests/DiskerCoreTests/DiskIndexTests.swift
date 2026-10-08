@@ -6,6 +6,83 @@ import Testing
 
 @Suite(.serialized)
 struct DiskIndexTests {
+    @Test(arguments: [true, false])
+    func overlappingSelectionsShareObservedFiles(childFirst: Bool) async throws {
+        let fixture: URL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("disker-shared-tree-" + UUID().uuidString)
+        let parent: URL = fixture.appendingPathComponent("parent")
+        let child: URL = parent.appendingPathComponent("child")
+        let file: URL = child.appendingPathComponent("nested/file")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: fixture) }
+            catch { Issue.record(error) }
+        }
+        try Data(repeating: 1, count: 17).write(to: file)
+        try Data(repeating: 2, count: 3).write(to: parent.appendingPathComponent("sibling"))
+        let cache: URL = fixture.appendingPathComponent("cache/index.sqlite")
+        let index: DiskIndex = try DiskIndex(databaseURL: cache)
+        let first: URL = childFirst ? child : parent
+        let second: URL = childFirst ? parent : child
+        _ = try await index.refresh(root: first.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+
+        let observed: IndexedNode? = try await index.node(root: second.path, path: Data(file.path.utf8))
+        #expect(observed?.entry.metadata.logicalBytes == 17, "A file already observed through another selection must be immediately available")
+        let cached: IndexSummary? = try await index.cachedSummary(root: second.path)
+        #expect(cached != nil, "Ancestor and descendant views must project the shared cache before another traversal")
+        #expect(cached?.logicalBytes == 17)
+        #expect(cached?.nodeCount == (childFirst ? 4 : 3))
+        #expect(try await index.cachedSummary(root: child.path)?.isComplete == true, "Completed child coverage must be shared before selecting another folder")
+        let progress: IndexProgress = try #require(try await index.cachedProgress(root: second.path))
+        #expect(progress.entriesObserved == cached?.nodeCount)
+        #expect(progress.completionFraction > 0, "Changing the view must restore observed directory work")
+        #expect(try await index.cachedSummary(root: "/")?.logicalBytes == (childFirst ? 17 : 20))
+        #expect(try await index.cachedSummary(root: "/")?.isComplete == false)
+
+        let refreshed: IndexSummary = try await index.refresh(root: second.path, mode: .automatic, receiveEvent: { _ in }, isCancelled: { false })
+        #expect(refreshed.logicalBytes == (childFirst ? 20 : 17))
+        #expect(try await index.cachedSummary(root: "/")?.logicalBytes == 20)
+        #expect(refreshed.nodeCount == (childFirst ? 5 : 3))
+        let reopened: DiskIndex = try DiskIndex(databaseURL: cache)
+        #expect(try await reopened.node(root: parent.path, path: Data(file.path.utf8)) == reopened.node(root: child.path, path: Data(file.path.utf8)))
+    }
+
+    @Test func interruptedParentScanSharesCompletedChildBeforeParentFinishes() async throws {
+        let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-shared-partial-" + UUID().uuidString).resolvingSymlinksInPath()
+        let parent: URL = fixture.appendingPathComponent("parent")
+        let child: URL = parent.appendingPathComponent("a")
+        let other: URL = parent.appendingPathComponent("b")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: fixture) }
+            catch { Issue.record(error) }
+        }
+        for number: Int in 0..<600 {
+            try Data([1]).write(to: child.appendingPathComponent("file-\(number)"))
+            try Data([2]).write(to: other.appendingPathComponent("file-\(number)"))
+        }
+        let cache: URL = fixture.appendingPathComponent("cache/index.sqlite")
+        let index: DiskIndex = try DiskIndex(databaseURL: cache)
+        let cancelled: Mutex<Bool> = Mutex(false)
+        await #expect(throws: ScanError.cancelled) {
+            try await index.refresh(root: parent.path, mode: .automatic, receiveEvent: { event in
+                if case .progress(let progress) = event, progress.completionFraction > 0.4 {
+                    cancelled.withLock { $0 = true }
+                }
+            }, isCancelled: { cancelled.withLock { $0 } })
+        }
+        let reopened: DiskIndex = try DiskIndex(databaseURL: cache)
+        #expect(try await reopened.node(root: child.path, path: Data(child.appendingPathComponent("file-0").path.utf8))?.entry.metadata.logicalBytes == 1)
+        #expect(try await reopened.cachedSummary(root: child.path)?.logicalBytes == 600)
+        #expect(try await reopened.cachedSummary(root: child.path)?.isComplete == true, "Completed child coverage must survive interruption and reopening")
+        let progress: IndexProgress = try #require(try await reopened.cachedProgress(root: child.path))
+        #expect(progress.entriesObserved == 601)
+        #expect(progress.completionFraction == 0.95)
+        let resumed: IndexSummary = try await reopened.refresh(root: child.path, mode: .automatic, receiveEvent: { _ in }, isCancelled: { false })
+        #expect(resumed.logicalBytes == 600)
+        #expect(resumed.nodeCount == progress.entriesObserved)
+    }
+
     @Test(arguments: [SortOrder.forward, .reverse])
     func selectedColumnsSortTheWholeDirectoryBeforePaging(order: SortOrder) async throws {
         let fixture: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-columns-" + UUID().uuidString)
@@ -101,7 +178,8 @@ struct DiskIndexTests {
                 return nil
             }
         }
-        #expect(incremental.contains { $0 > 0 && $0 < 0.75 })
+        #expect(incremental.first == 0.95)
+        #expect(incremental.dropLast().allSatisfy { $0 < 1 })
         #expect(incremental.last == 1)
         #expect(zip(incremental, incremental.dropFirst()).allSatisfy { $0 <= $1 })
         let incrementalEvents: [IndexEvent] = events.withLock { $0 }
@@ -113,7 +191,8 @@ struct DiskIndexTests {
             if case let .progress(progress) = event { return progress }
             return nil
         }.last
-        #expect(finalProgress?.entriesObserved == observedEntries)
+        #expect(finalProgress?.entriesObserved == summary.nodeCount)
+        #expect(observedEntries > 0)
     }
 
     @Test func incrementalProgressWaitsForNewSubtrees() async throws {
@@ -163,7 +242,7 @@ struct DiskIndexTests {
         }
         #expect(fractions.withLock { $0.contains { $0 > 0 && $0 < 1 } })
         #expect(fractions.withLock { !$0.contains(1) })
-        #expect(try await index.cachedSummary(root: root.path)?.revision == previous.revision)
+        #expect(try await index.cachedSummary(root: root.path)!.revision > previous.revision)
     }
 
     @Test(.enabled(if: geteuid() != 0))

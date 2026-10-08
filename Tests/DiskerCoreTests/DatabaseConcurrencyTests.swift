@@ -91,14 +91,14 @@ struct DatabaseConcurrencyTests {
         let firstSummary: IndexSummary = try await firstRefresh.value
         let (children, cached): ([IndexedNode], IndexSummary?) = try await query.value
         #expect(children.count == 1)
-        #expect(children.first?.entry.metadata.logicalBytes == 3)
-        #expect(cached?.revision == previous.revision)
-        #expect(cached?.logicalBytes == 3)
+        #expect(children.first?.entry.metadata.logicalBytes == 9)
+        #expect(cached!.revision > previous.revision)
+        #expect(cached?.logicalBytes == 9)
         let secondSummary: IndexSummary = try await secondRefresh.value
         #expect(firstSummary.logicalBytes == 9)
         #expect(secondSummary.logicalBytes == 9)
-        #expect(firstSummary.revision == previous.revision + 1)
-        #expect(secondSummary.revision == firstSummary.revision + 1)
+        #expect(firstSummary.revision > previous.revision)
+        #expect(secondSummary.revision > firstSummary.revision)
     }
 
     @Test func cancelledRefreshStopsWaitingWithoutCommitting() async throws {
@@ -135,7 +135,7 @@ struct DatabaseConcurrencyTests {
         let firstSummary: IndexSummary = try await firstRefresh.value
         await #expect(throws: ScanError.cancelled) { try await secondRefresh.value }
         let cached: IndexSummary? = try await second.cachedSummary(root: root.path)
-        #expect(firstSummary.revision == previous.revision + 1)
+        #expect(firstSummary.revision > previous.revision)
         #expect(cached?.revision == firstSummary.revision)
         #expect(cached?.logicalBytes == 9)
     }
@@ -171,7 +171,7 @@ struct DatabaseConcurrencyTests {
         #expect(scannedWhileLocked == .timedOut)
         guard flock(descriptor, LOCK_UN) == 0 else { throw ScanError.systemCall(path: Data(lockPath.utf8), operation: "flock", errnoCode: errno) }
         let summary: IndexSummary = try await refresh.value
-        #expect(summary.revision == previous.revision + 1)
+        #expect(summary.revision > previous.revision)
         #expect(summary.logicalBytes == 3)
     }
 }

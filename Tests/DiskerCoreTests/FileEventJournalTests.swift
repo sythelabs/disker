@@ -135,12 +135,18 @@ struct FileEventJournalTests {
         #expect(reconciliationScopes(events: [event], rootPath: "/fixture").requiresFullScan)
     }
 
-    @Test func rootFilesystemRequiresScanInsteadOfSingleVolumeReplay() throws {
+    @Test func hostJournalReopensWithoutDiscardingCoverage() throws {
         let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: nil, latency: 0.01)
         defer { journal.stop() }
         let replay: JournalReplay = try journal.replay(timeout: 5, isCancelled: { false })
         #expect(replay.requiresFullScan)
-        #expect(replay.checkpoint == nil)
+        let checkpoint: JournalCheckpoint = try #require(replay.checkpoint)
+        journal.stop()
+        let reopened: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: checkpoint, latency: 0.01)
+        defer { reopened.stop() }
+        let resumed: JournalReplay = try reopened.replay(timeout: 5, isCancelled: { false })
+        #expect(!resumed.requiresFullScan)
+        #expect(resumed.checkpoint?.journalID == checkpoint.journalID)
     }
 
     @Test func restartReplaysCreatesModificationsAndDeletions() throws {

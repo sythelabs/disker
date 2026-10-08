@@ -10,7 +10,6 @@ struct ContentView: View {
     @State private var model: DiskTreeModel
     @State private var locations: SidebarLocations
     @State private var sidebarSelection: SidebarSelection?
-    @State private var selection: Set<DiskTreeRowID> = []
     @State private var searchText: String = ""
     @State private var choosingFolder: Bool = false
     @State private var showingIssues: Bool = false
@@ -123,17 +122,17 @@ struct ContentView: View {
         }
         .onDisappear { model.cancelScan() }
         .onChange(of: model.rootPath) { _, _ in
-            selection = []
+            model.selection = []
             searchText = ""
         }
-        .onChange(of: searchText) { _, _ in selection = [] }
+        .onChange(of: searchText) { _, _ in model.selection = [] }
         .onChange(of: model.sortOrder) { _, _ in
             Task { await model.sort() }
         }
     }
 
     private var tree: some View {
-        Table(of: DiskTreeRow.self, selection: $selection, sortOrder: $model.sortOrder) {
+        Table(of: DiskTreeRow.self, selection: $model.selection, sortOrder: $model.sortOrder) {
             TableColumn("Name", sortUsing: DiskTreeSort(sort: NodeSort(column: .name, order: .forward))) { row in
                 TreeNameCell(row: row, model: model)
             }
@@ -211,19 +210,19 @@ struct ContentView: View {
             }
         }
         .onKeyPress(.rightArrow) {
-            guard selection.count == 1, case .node(let path) = selection.first,
-                  let row: DiskTreeRow = model.rows.first(where: { selection.contains($0.id) }),
+            guard model.selection.count == 1, case .node(let path) = model.selection.first,
+                  let row: DiskTreeRow = model.rows.first(where: { model.selection.contains($0.id) }),
                   row.node?.entry.metadata.kind == .directory else { return .ignored }
             if model.expanded.contains(path) {
-                if let child: DiskTreeRow = visibleRows.first(where: { $0.node?.entry.parentPath == path }) { selection = [child.id] }
+                if let child: DiskTreeRow = visibleRows.first(where: { $0.node?.entry.parentPath == path }) { model.selection = [child.id] }
             } else { Task { await model.toggle(path) } }
             return .handled
         }
         .onKeyPress(.leftArrow) {
-            guard selection.count == 1, case .node(let path) = selection.first,
-                  let row: DiskTreeRow = model.rows.first(where: { selection.contains($0.id) }) else { return .ignored }
+            guard model.selection.count == 1, case .node(let path) = model.selection.first,
+                  let row: DiskTreeRow = model.rows.first(where: { model.selection.contains($0.id) }) else { return .ignored }
             if model.expanded.contains(path) { Task { await model.toggle(path) } }
-            else if let parent: Data = row.node?.entry.parentPath { selection = [.node(parent)] }
+            else if let parent: Data = row.node?.entry.parentPath { model.selection = [.node(parent)] }
             else { return .ignored }
             return .handled
         }
@@ -270,7 +269,7 @@ struct ContentView: View {
     }
 
     private func chooseRoot(_ url: URL) {
-        selection = []
+        model.selection = []
         Task { await model.chooseRoot(url) }
     }
 
@@ -328,7 +327,7 @@ struct ContentView: View {
             do {
                 if item.isDirectory {
                     guard String(data: item.id, encoding: .utf8) != nil else { throw FileOperationError.pathNotUTF8(item.url) }
-                    selection = []
+                    model.selection = []
                     await model.chooseRoot(item.url)
                 } else { try await operations.open(item) }
             } catch { fileOperationError = error.localizedDescription }
@@ -415,7 +414,7 @@ struct ContentView: View {
         guard !operating else { return }
         operating = true
         let originalRoot: String = model.rootPath
-        let originalSelection: Set<DiskTreeRowID> = selection
+        let originalSelection: Set<DiskTreeRowID> = model.selection
         Task {
             defer { operating = false }
             var change: FileChange?
@@ -425,20 +424,20 @@ struct ContentView: View {
             do {
                 let root: Data = Data(model.rootPath.utf8)
                 if let removed: URL = try change?.removedURLs.first(where: { try filePathBytes($0) == root }) {
-                    selection = []
+                    model.selection = []
                     await model.chooseRoot(change?.insertedURL ?? removed.deletingLastPathComponent())
                 } else {
                     let prefix: Data = root.last == 47 ? root : root + Data([47])
                     let paths: [Data] = try directories.map(filePathBytes).filter { $0 == root || $0.starts(with: prefix) }
                     if !paths.isEmpty { await model.refreshDirectories(paths) }
                     guard model.rootPath == originalRoot else { return }
-                    if selection == originalSelection {
+                    if model.selection == originalSelection {
                         if let inserted: URL = change?.insertedURL {
                             let id: DiskTreeRowID = .node(try filePathBytes(inserted))
-                            if model.rows.contains(where: { $0.id == id }) { selection = [id] }
+                            if model.rows.contains(where: { $0.id == id }) { model.selection = [id] }
                         }
                     }
-                    selection.formIntersection(Set(model.rows.map(\.id)))
+                    model.selection.formIntersection(Set(model.rows.map(\.id)))
                 }
             } catch { fileOperationError = error.localizedDescription }
         }
@@ -446,15 +445,15 @@ struct ContentView: View {
 
     private func handleFileKeyPress(_ press: KeyPress) -> KeyPress.Result {
         do {
-            let item: FileItem? = try node(in: selection).map { try FileItem(entry: $0.entry) }
+            let item: FileItem? = try node(in: model.selection).map { try FileItem(entry: $0.entry) }
             let destination: URL = item.map { $0.isDirectory ? $0.url : $0.url.deletingLastPathComponent() } ?? URL(fileURLWithPath: model.rootPath)
-            if press.key == "v", press.modifiers == .command, selection.count <= 1, !operating, !clipboardItems.isEmpty { paste(into: destination); return .handled }
-            if press.key == "v", press.modifiers == [.command, .option], selection.count <= 1, !operating, !clipboardItems.isEmpty { move(into: destination); return .handled }
-            if press.key == "c", press.modifiers == .command, selection.count > 1 { copySelection(selection); return .handled }
+            if press.key == "v", press.modifiers == .command, model.selection.count <= 1, !operating, !clipboardItems.isEmpty { paste(into: destination); return .handled }
+            if press.key == "v", press.modifiers == [.command, .option], model.selection.count <= 1, !operating, !clipboardItems.isEmpty { move(into: destination); return .handled }
+            if press.key == "c", press.modifiers == .command, model.selection.count > 1 { copySelection(model.selection); return .handled }
             // macOS Delete sends DEL (0x7f), while SwiftUI's .delete represents backspace (0x08).
             if (press.key == .delete || press.key == KeyEquivalent("\u{7f}")), press.modifiers == .command, !operating,
-               selection.contains(where: { if case .node = $0 { return true }; return false }) {
-                trashSelection(selection)
+               model.selection.contains(where: { if case .node = $0 { return true }; return false }) {
+                trashSelection(model.selection)
                 return .handled
             }
             guard let item else { return .ignored }

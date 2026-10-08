@@ -16,11 +16,6 @@ private enum TreeFixtureError: Error {
     case timedOut(String)
 }
 
-private enum TreePreviewReplay: CaseIterable, Sendable {
-    case branch
-    case rootDirectory
-}
-
 private func treeFixture() throws -> TreeFixture {
     let container: URL = FileManager.default.temporaryDirectory.appendingPathComponent("disker-tree-" + UUID().uuidString).resolvingSymlinksInPath()
     let root: URL = container.appendingPathComponent("root")
@@ -68,8 +63,52 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
 
 @Suite("Disk tree model", .serialized)
 @MainActor struct DiskTreeModelTests {
+    @Test(arguments: [NodeSortColumn.sizeProportion, .allocatedSize, .items], [SortOrder.forward, .reverse])
+    func firstLaunchSortsGrowingBranchesBeforeCommit(column: NodeSortColumn, order: SortOrder) async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let first: URL = fixture.root.appendingPathComponent("a")
+        let second: URL = fixture.root.appendingPathComponent("b")
+        try treeFiles(directory: first, count: 1, bytes: 4_096)
+        try treeFiles(directory: second, count: 2, bytes: 32_768)
+        let root: Data = Data(fixture.root.path.utf8)
+        let firstPath: Data = Data(first.path.utf8)
+        let secondPath: Data = Data(second.path.utf8)
+        let arrived: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        defer { release.signal(); release.signal() }
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            guard case .batch(let entries) = event,
+                  entries.contains(where: { $0.parentPath == firstPath || $0.parentPath == secondPath }) else { return }
+            arrived.signal()
+            if release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing first-launch preview scan") }
+        })
+        if column != .sizeProportion || order != .reverse {
+            model.sortOrder = [DiskTreeSort(sort: NodeSort(column: column, order: order))]
+        }
+        await model.start()
+        for (path, bytes, expected): (Data, UInt64, [DiskTreeRowID]) in [
+            (firstPath, 4_096, [.node(firstPath), .node(secondPath)]),
+            (secondPath, 65_536, [.node(secondPath), .node(firstPath)])
+        ] {
+            try #require(await waitForTreeSignal(arrived, timeout: .now() + 5) == .success)
+            let deadline: Date = Date().addingTimeInterval(5)
+            while model.rows.first(where: { $0.id == .node(path) })?.node?.subtreeLogicalBytes != bytes && Date() < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(model.isScanning)
+            #expect(model.summary?.isComplete == false)
+            #expect(model.rows.first { $0.id == .node(path) }?.node?.subtreeLogicalBytes == bytes)
+            let ordered: [DiskTreeRowID] = order == .reverse ? expected : expected.reversed()
+            #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == ordered, "First-launch previews must honor the active sort while scanning")
+            release.signal()
+        }
+        try await waitForTreeScan(model)
+        #expect(model.errorMessage == nil)
+    }
+
     @Test(arguments: [NodeSortColumn.sizeProportion, .allocatedSize, .items])
-    func sortedInitialScanKeepsRowsInPlaceUntilCommit(column: NodeSortColumn) async throws {
+    func selectedInitialScanKeepsRowsInPlaceUntilSelectionClears(column: NodeSortColumn) async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
         let first: URL = fixture.root.appendingPathComponent("a")
@@ -95,6 +134,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         await model.sort()
         let initial: [DiskTreeRowID] = model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id)
         try #require(initial.count == 2)
+        model.selection = [initial[0]]
         release.signal()
         try #require(await waitForTreeSignal(arrived, timeout: .now() + 5) == .success)
         let deadline: Date = Date().addingTimeInterval(5)
@@ -103,6 +143,15 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         }
         #expect(model.rows.first { $0.id == .node(Data(first.path.utf8)) }?.node?.subtreeLogicalBytes == 32_768)
         #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == initial, "Growing scan totals moved rows between clicks after selecting a sort column")
+        #expect(model.selection == [initial[0]])
+        model.selection = []
+        let resumed: Date = Date().addingTimeInterval(5)
+        while model.rows.filter({ $0.node?.entry.parentPath == root }).map(\.id) == initial && Date() < resumed {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.isScanning)
+        #expect(model.summary?.isComplete == false)
+        #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == [.node(Data(second.path.utf8)), .node(Data(first.path.utf8))])
         release.signal()
         try await waitForTreeScan(model)
         #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == [.node(Data(second.path.utf8)), .node(Data(first.path.utf8))])
@@ -143,7 +192,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
             try await Task.sleep(for: .milliseconds(10))
         }
         #expect(model.isScanning)
-        #expect(model.summary == nil)
+        #expect(model.summary?.isComplete == false)
         #expect(model.scanProgress > 0.4)
         let restored: IndexedNode = try #require(model.rows.compactMap(\.node).first { $0.entry.path == Data(branch.path.utf8) })
         #expect(restored.subtreeLogicalBytes == 3600)
@@ -155,20 +204,20 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
     }
 
     @Test(arguments: [(0, 1), (0, 510), (510, 510)])
-    func foldersExpandBeforeTheInitialScanCommits(rootFileCount: Int, folderFileCount: Int) async throws {
+    func observedFoldersExpandWhileTheInitialScanContinues(rootFileCount: Int, folderFileCount: Int) async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
         let folder: URL = fixture.root.appendingPathComponent("folder")
         let nested: URL = folder.appendingPathComponent("nested")
         try treeFiles(directory: folder, count: folderFileCount, bytes: 4_096)
         try treeFiles(directory: nested, count: 1, bytes: 8_192)
-        try treeFiles(directory: fixture.root.appendingPathComponent("padding"), count: 600, bytes: 1)
+        try treeFiles(directory: fixture.root.appendingPathComponent("zzzzzzzzzzzzzzzz"), count: 600, bytes: 1)
         try treeFiles(directory: fixture.root, count: rootFileCount, bytes: 1)
         let release: DispatchSemaphore = DispatchSemaphore(value: 0)
         let paused: Mutex<Bool> = Mutex(false)
         defer { release.signal() }
         let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
-            guard case .batch = event else { return }
+            guard case .batch(let entries) = event, entries.contains(where: { $0.parentPath == Data(fixture.root.appendingPathComponent("zzzzzzzzzzzzzzzz").path.utf8) }) else { return }
             let shouldPause: Bool = paused.withLock { state in
                 if state { return false }
                 state = true
@@ -183,7 +232,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         let nestedPath: Data = Data(nested.path.utf8)
         let rootPath: Data = Data(fixture.root.path.utf8)
         let deadline: Date = Date().addingTimeInterval(5)
-        while model.rows.isEmpty && Date() < deadline {
+        while (!paused.withLock({ $0 }) || model.rows.isEmpty || model.summary?.nodeCount != Int64(folderFileCount + rootFileCount + 516)) && Date() < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
         try #require(!model.rows.isEmpty)
@@ -194,7 +243,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         }
         try #require(model.rows.contains { $0.id == .node(folderPath) })
         #expect(model.isScanning)
-        #expect(model.summary == nil)
+        #expect(model.summary?.isComplete == false)
         await model.toggle(folderPath)
         #expect(model.expanded.contains(folderPath))
         #expect(model.rows.contains { $0.id == .node(Data(folder.appendingPathComponent("file-0").path.utf8)) }, "Expanding a visible folder during the initial scan shows no children")
@@ -209,7 +258,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         await model.toggle(nestedPath)
         let nestedFile: DiskTreeRowID = .node(Data(nested.appendingPathComponent("file-0").path.utf8))
         #expect(model.rows.contains { $0.id == nestedFile })
-        #expect(model.summary == nil)
+        #expect(model.summary?.isComplete == false)
         let visibleIDs: [DiskTreeRowID] = model.rows.map(\.id)
         try await Task.sleep(for: .milliseconds(200))
         #expect(model.rows.map(\.id) == visibleIDs, "Scan preview updates must retain expanded branches and loaded pages")
@@ -286,7 +335,33 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.errorMessage == nil)
     }
 
-    @Test func scanProgressFinishesAndResetsOnRefresh() async throws {
+    @Test func parentChildNavigationRestoresSharedRowsCountsAndProgress() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let child: URL = fixture.root.appendingPathComponent("child")
+        try treeFiles(directory: child, count: 600, bytes: 3)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: child, cacheURL: fixture.cache)
+        await model.start()
+        try await waitForTreeScan(model)
+        #expect(model.scannedEntries == 601)
+        await model.chooseRoot(fixture.root)
+        #expect(model.scannedEntries >= 602)
+        #expect(model.scanProgress > 0)
+        #expect(model.rows.contains { $0.node?.entry.path == Data(child.path.utf8) && $0.node?.subtreeLogicalBytes == 1800 })
+        try await waitForTreeScan(model)
+        await model.goBack()
+        #expect(model.scannedEntries == 601)
+        #expect(model.scanProgress > 0.9)
+        #expect(model.rows.count == 502)
+        try await waitForTreeScan(model)
+        await model.goForward()
+        #expect(model.scannedEntries == 602)
+        #expect(model.scanProgress > 0.9)
+        try await waitForTreeScan(model)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test func scanProgressAndObservedCountSurviveRefresh() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
         try treeFiles(directory: fixture.root.appendingPathComponent("folder/nested"), count: 3, bytes: 1)
@@ -300,9 +375,11 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.scanProgress == 1)
         #expect(!model.isScanning)
 
+        let count: Int64 = model.scannedEntries
         model.refresh()
         #expect(model.isScanning)
-        #expect(model.scanProgress == 0)
+        #expect(model.scanProgress == 1)
+        #expect(model.scannedEntries == count)
         try await waitForTreeScan(model)
         #expect(model.errorMessage == nil)
         #expect(model.scanProgress == 1)
@@ -328,81 +405,6 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(!model.rows.contains { $0.id == .node(Data(old.path.utf8)) })
         #expect(model.rows.contains { $0.id == .node(Data(renamed.path.utf8)) })
         #expect(model.expanded.contains(Data(folder.path.utf8)))
-    }
-
-    @Test(arguments: TreePreviewReplay.allCases)
-    fileprivate func repeatedPreviewScopeDoesNotCountFilesTwice(replay: TreePreviewReplay) async throws {
-        let fixture: TreeFixture = try treeFixture()
-        defer { removeTreeFixture(fixture) }
-        let folder: URL = fixture.root.appendingPathComponent("folder")
-        let file: URL = folder.appendingPathComponent("file-0")
-        try treeFiles(directory: folder, count: 1, bytes: 8_192)
-        let index: DiskIndex = try await cachedTree(fixture: fixture)
-        let rootEntry: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(fixture.root.path.utf8))).entry
-        let folderEntry: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(folder.path.utf8))).entry
-        let fileEntry: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(file.path.utf8))).entry
-        let buffer: TreeScanBuffer = TreeScanBuffer(root: rootEntry.path, capturePreview: true, limit: 500)
-        buffer.receive(.batch([rootEntry, folderEntry, fileEntry]))
-        let before: IndexedNode = try #require(buffer.snapshot().nodes.first)
-        switch replay {
-        case .branch:
-            let scope: ScanEntry = ScanEntry(path: folderEntry.path, parentPath: nil, name: folderEntry.name, metadata: folderEntry.metadata)
-            buffer.receive(.batch([scope, fileEntry]))
-        case .rootDirectory:
-            buffer.receive(.batch([rootEntry, folderEntry]))
-        }
-        let after: IndexedNode = try #require(buffer.snapshot().nodes.first)
-        #expect(after.subtreeLogicalBytes == before.subtreeLogicalBytes)
-        #expect(after.subtreeAllocatedBytes == before.subtreeAllocatedBytes)
-        #expect(after.subtreeNodeCount == before.subtreeNodeCount)
-        #expect(after.subtreeNodeCount == 2)
-    }
-
-    @Test func previewIncludesDirectoryAllocatedBytesInItsBranchTotal() async throws {
-        let fixture: TreeFixture = try treeFixture()
-        defer { removeTreeFixture(fixture) }
-        let folder: URL = fixture.root.appendingPathComponent("folder")
-        try treeFiles(directory: folder, count: 1, bytes: 8_192)
-        let index: DiskIndex = try await cachedTree(fixture: fixture)
-        let rootEntry: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(fixture.root.path.utf8))).entry
-        let folderEntry: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(folder.path.utf8))).entry
-        let childEntry: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(folder.appendingPathComponent("file-0").path.utf8))).entry
-        let metadata: FileMetadata = folderEntry.metadata
-        let allocatedDirectory: FileMetadata = FileMetadata(kind: metadata.kind, device: metadata.device, inode: metadata.inode, linkCount: metadata.linkCount, mode: metadata.mode, ownerID: metadata.ownerID, groupID: metadata.groupID, logicalBytes: metadata.logicalBytes, allocatedBytes: 4_096, birthTime: metadata.birthTime, modificationTime: metadata.modificationTime, changeTime: metadata.changeTime, accessTime: metadata.accessTime, flags: metadata.flags)
-        let directoryEntry: ScanEntry = ScanEntry(path: folderEntry.path, parentPath: folderEntry.parentPath, name: folderEntry.name, metadata: allocatedDirectory)
-        let buffer: TreeScanBuffer = TreeScanBuffer(root: rootEntry.path, capturePreview: true, limit: 500)
-        buffer.receive(.batch([rootEntry, directoryEntry, childEntry]))
-        let node: IndexedNode = try #require(buffer.snapshot().nodes.first)
-        #expect(node.subtreeAllocatedBytes == 4_096 + childEntry.metadata.allocatedBytes)
-        #expect(node.subtreeLogicalBytes == childEntry.metadata.logicalBytes)
-        #expect(node.subtreeNodeCount == 2)
-    }
-
-    @Test func previewSizeUpdatesDoNotMoveFoldersBetweenClicks() async throws {
-        let fixture: TreeFixture = try treeFixture()
-        defer { removeTreeFixture(fixture) }
-        let firstFolder: URL = fixture.root.appendingPathComponent("first")
-        let secondFolder: URL = fixture.root.appendingPathComponent("second")
-        try treeFiles(directory: firstFolder, count: 1, bytes: 4_096)
-        try treeFiles(directory: secondFolder, count: 1, bytes: 32_768)
-        let index: DiskIndex = try await cachedTree(fixture: fixture)
-        let root: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(fixture.root.path.utf8))).entry
-        let first: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(firstFolder.path.utf8))).entry
-        let second: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(secondFolder.path.utf8))).entry
-        let firstFile: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(firstFolder.appendingPathComponent("file-0").path.utf8))).entry
-        let secondFile: ScanEntry = try #require(try await index.node(root: fixture.root.path, path: Data(secondFolder.appendingPathComponent("file-0").path.utf8))).entry
-        let buffer: TreeScanBuffer = TreeScanBuffer(root: root.path, capturePreview: true, limit: 500)
-        buffer.receive(.batch([root, first, second, firstFile]))
-        let before: [Data] = buffer.snapshot().nodes.map(\.entry.path)
-
-        buffer.receive(.batch([secondFile]))
-        let after: TreeScanPreview = buffer.snapshot()
-        #expect(after.nodes.map(\.entry.path) == before, "Growing sizes moved a different folder into the row being clicked")
-        #expect(after.nodes.last?.subtreeAllocatedBytes == secondFile.metadata.allocatedBytes + second.metadata.allocatedBytes)
-        let sorted: TreeScanPreview = try after.sorted(using: NodeSort(column: .allocatedSize, order: .reverse))
-        #expect(sorted.nodes.map(\.entry.path) == [second.path, first.path])
-        #expect(sorted.totals.allocated == after.totals.allocated)
-        #expect(buffer.snapshot().nodes.map(\.entry.path) == before)
     }
 
     @Test func nestedFoldersAndFilesCollapseAndReexpandWithParentProportions() async throws {
@@ -532,7 +534,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         let connection: DatabaseQueue = try DatabaseQueue(path: fixture.cache.path)
         try await connection.write { db in
             for number: Int in paths.indices {
-                try db.execute(sql: "UPDATE nodes SET path=?,name=? WHERE root=? AND path=?", arguments: [paths[number], Data([paths[number].last!]), fixture.root.path, Data(fixture.root.appendingPathComponent("file-\(number)").path.utf8)])
+                try db.execute(sql: "UPDATE nodes SET path=?,name=? WHERE path=?", arguments: [paths[number], Data([paths[number].last!]), Data(fixture.root.appendingPathComponent("file-\(number)").path.utf8)])
             }
         }
         let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
@@ -556,7 +558,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         let summary: IndexSummary = try #require(try await index.cachedSummary(root: fixture.root.path))
         let connection: DatabaseQueue = try DatabaseQueue(path: fixture.cache.path)
         try await connection.write { db in
-            try db.execute(sql: "INSERT INTO aliases(root,path,target,seen) VALUES(?,?,?,?)", arguments: [fixture.root.path, Data(alias.path.utf8), Data(target.path.utf8), summary.revision])
+            try db.execute(sql: "INSERT INTO aliases(path,target,seen) VALUES(?,?,?)", arguments: [Data(alias.path.utf8), Data(target.path.utf8), summary.revision])
         }
         let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
         await model.start()
@@ -607,12 +609,12 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
         await model.start()
         #expect(model.isScanning)
-        #expect(model.summary?.revision == previous.revision)
+        #expect(model.summary!.revision > previous.revision)
         #expect(model.summary?.logicalBytes == 3)
-        #expect(model.rows.count == 2)
+        #expect(model.rows.count == 3)
         await model.chooseRoot(other)
         #expect(model.rootPath == other.path)
-        #expect(model.scanProgress == 0)
+        #expect(model.scanProgress > 0.9)
         #expect(model.summary?.logicalBytes == 7)
         #expect(model.rows.count == 2)
         #expect(model.isScanning)
