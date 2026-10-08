@@ -195,7 +195,7 @@ public actor DiskIndex {
         let checkpoint: JournalCheckpoint? = try await pool.read { db in
             try Data.fetchOne(db, sql: "SELECT checkpoint FROM cache_state WHERE id=1").map { try JSONDecoder().decode(JournalCheckpoint.self, from: $0) }
         }
-        let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: checkpoint, latency: 0.05)
+        let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: checkpoint, latency: 0.05, excludedPaths: cacheDirectories)
         defer { journal.stop() }
         let replay: JournalReplay = try journal.replay(timeout: 10, isCancelled: isCancelled)
         let rootPath: Data = Data(root.utf8)
@@ -270,6 +270,14 @@ public actor DiskIndex {
                 let report: ScanSummary = try await enumerate(path: path, options: options, receiveEvent: receiveEvent, publishProgress: publishProgress, isCancelled: isCancelled)
                 metrics = addMetrics(metrics, report.metrics)
                 try publishProgress()
+                if journal.hasPendingChanges {
+                    let pending: JournalReplay = try journal.takePending()
+                    try await pool.write { db in
+                        _ = try beginCacheChanges(db)
+                        try applyCacheReplay(db, replay: pending)
+                        try rebuildCacheTotals(db)
+                    }
+                }
             }
             if isCancelled() { throw ScanError.cancelled }
             let pending: JournalReplay = try journal.drain()
