@@ -371,6 +371,63 @@ struct IncrementalIndexTests {
         #expect(summary.issues.contains { $0.kind == .excluded && $0.path == Data(fixture.root.appendingPathComponent("cache").path.utf8) })
     }
 
+    @Test func changeStreamIsAttachedBeforeReturning() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let changes: AsyncThrowingStream<Void, any Error> = try await index.changes(root: fixture.root.path)
+        let received: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let observer: Task<Void, Never> = Task {
+            do {
+                for try await _ in changes { received.signal() }
+            } catch {
+                if !Task.isCancelled { Issue.record(error) }
+            }
+        }
+        defer { observer.cancel() }
+        let created: URL = fixture.root.appendingPathComponent("created-after-attachment")
+        try Data(repeating: 1, count: 1_024).write(to: created)
+        #expect(await waitForIncrementalSignal(received, timeout: .now() + 5) == .success)
+        observer.cancel()
+        await observer.value
+    }
+
+    @Test func changeStreamIgnoresCacheAndSiblingWritesThroughSymlinkPaths() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        try createIncrementalFiles(directory: fixture.root, count: 1, bytes: 1_024)
+        let alias: URL = fixture.container.appendingPathComponent("root-alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.root)
+        let index: DiskIndex = try DiskIndex(databaseURL: alias.appendingPathComponent("cache/index.sqlite"))
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        let changes: AsyncThrowingStream<Void, any Error> = try await index.changes(root: fixture.root.path)
+        let notifications: Mutex<Int> = Mutex(0)
+        let received: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let observer: Task<Void, Never> = Task {
+            do {
+                for try await _ in changes {
+                    notifications.withLock { $0 += 1 }
+                    received.signal()
+                }
+            } catch {
+                if !Task.isCancelled { Issue.record(error) }
+            }
+        }
+        defer { observer.cancel() }
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        try mutateAfterJournalFence(root: fixture.container, requiredDirectories: [fixture.container.path]) {
+            try Data(repeating: 3, count: 512).write(to: fixture.container.appendingPathComponent("unrelated-sibling"))
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(notifications.withLock { $0 } == 0)
+        try Data(repeating: 2, count: 2_048).write(to: fixture.root.appendingPathComponent("file-0"))
+        #expect(await waitForIncrementalSignal(received, timeout: .now() + 5) == .success)
+        #expect(notifications.withLock { $0 } > 0)
+        observer.cancel()
+        await observer.value
+    }
+
     @Test func cachedQueriesFinishWhileRefreshHasUncommittedStreamingBatches() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
@@ -535,6 +592,134 @@ struct IncrementalIndexTests {
         #expect(try await index.node(root: fixture.root.path, path: Data(replaced.path.utf8))?.entry.metadata.kind == .regularFile)
         #expect(try await index.node(root: fixture.root.path, path: Data(nested.appendingPathComponent("file-0").path.utf8)) == nil)
         #expect(try await index.children(root: fixture.root.path, directory: Data(replaced.path.utf8), offset: 0, limit: 10).isEmpty)
+    }
+
+    @Test func deletingPreviouslyScannedTrashUpdatesCachedRowsBeforeScanFinishes() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let trash: URL = fixture.root.appendingPathComponent(".Trash")
+        let trigger: URL = fixture.root.appendingPathComponent("zzzzzz-trigger")
+        let later: URL = fixture.root.appendingPathComponent("zzzzzzzzzzzzzzzz-pause")
+        try createIncrementalFiles(directory: trash, count: 2, bytes: 4_096)
+        try createIncrementalFiles(directory: trigger, count: 1, bytes: 3)
+        try createIncrementalFiles(directory: later, count: 1, bytes: 5)
+        let trashPath: Data = Data(trash.path.utf8)
+        let triggerPath: Data = Data(trigger.path.utf8)
+        let laterPath: Data = Data(later.path.utf8)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let initial: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let initialTrash: IndexedNode = try #require(try await index.node(root: fixture.root.path, path: trashPath))
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        let trashScanned: Mutex<Bool> = Mutex(false)
+        let mutated: Mutex<Bool> = Mutex(false)
+        let paused: Mutex<Bool> = Mutex(false)
+        let entered: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let refresh: Task<IndexSummary, any Error> = Task.detached(priority: .utility) {
+            try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in
+                guard case .batch(let batch) = event else { return }
+                if batch.contains(where: { $0.parentPath == trashPath }) { trashScanned.withLock { $0 = true } }
+                if batch.contains(where: { $0.parentPath == triggerPath }) {
+                    let shouldMutate: Bool = mutated.withLock { state in
+                        if state { return false }
+                        state = true
+                        return true
+                    }
+                    if shouldMutate {
+                        #expect(trashScanned.withLock { $0 })
+                        do {
+                            try mutateAfterJournalFence(root: fixture.root, requiredDirectories: [trash.path]) {
+                                try FileManager.default.removeItem(at: trash.appendingPathComponent("file-0"))
+                                try FileManager.default.removeItem(at: trash.appendingPathComponent("file-1"))
+                            }
+                        } catch { Issue.record(error) }
+                    }
+                }
+                guard batch.contains(where: { $0.parentPath == laterPath }) else { return }
+                let shouldPause: Bool = paused.withLock { state in
+                    if state { return false }
+                    state = true
+                    return true
+                }
+                if shouldPause {
+                    entered.signal()
+                    if release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing scan after Trash deletion") }
+                }
+            }, isCancelled: { false })
+        }
+        let scanPaused: DispatchTimeoutResult = await waitForIncrementalSignal(entered, timeout: .now() + 10)
+        #expect(scanPaused == .success)
+        #expect(mutated.withLock { $0 })
+        let children: [IndexedNode] = try await index.children(root: fixture.root.path, directory: trashPath, offset: 0, limit: 10)
+        let trashDuringScan: IndexedNode? = try await index.node(root: fixture.root.path, path: trashPath)
+        let summaryDuringScan: IndexSummary? = try await index.cachedSummary(root: fixture.root.path)
+        #expect(children.isEmpty)
+        #expect(trashDuringScan?.subtreeLogicalBytes == 0)
+        #expect(trashDuringScan?.subtreeNodeCount == 1)
+        #expect((trashDuringScan?.subtreeAllocatedBytes ?? initialTrash.subtreeAllocatedBytes) < initialTrash.subtreeAllocatedBytes)
+        #expect(summaryDuringScan?.logicalBytes == 8)
+        #expect(summaryDuringScan?.nodeCount == 6)
+        #expect((summaryDuringScan?.allocatedBytes ?? initial.allocatedBytes) < initial.allocatedBytes)
+        #expect(summaryDuringScan?.isComplete == false)
+        release.signal()
+        let final: IndexSummary = try await refresh.value
+        #expect(final.logicalBytes == 8)
+        #expect(final.nodeCount == 6)
+        #expect(final.isComplete)
+    }
+
+    @Test func repeatedHotDirectoryChangesAllowLaterWorkAndReachTheInstabilityLimit() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let hot: URL = fixture.root.appendingPathComponent("a-hot")
+        let later: URL = fixture.root.appendingPathComponent("zzzzzzzzzz-later")
+        try createIncrementalFiles(directory: hot, count: 1, bytes: 16)
+        try createIncrementalFiles(directory: later, count: 1, bytes: 32)
+        let hotPath: Data = Data(hot.path.utf8)
+        let laterPath: Data = Data(later.path.utf8)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        let attempts: Mutex<Int> = Mutex(0)
+        let laterEnumerated: Mutex<Bool> = Mutex(false)
+        let safetyCancellation: Mutex<Bool> = Mutex(false)
+        var reportedInstability: Bool = false
+        var reportedCancellation: Bool = false
+        do {
+            _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in
+                guard case .batch(let batch) = event else { return }
+                if batch.contains(where: { $0.parentPath == laterPath }) { laterEnumerated.withLock { $0 = true } }
+                guard batch.contains(where: { $0.parentPath == hotPath }) else { return }
+                let attempt: Int = attempts.withLock { count in
+                    count += 1
+                    return count
+                }
+                guard attempt <= 128 else {
+                    safetyCancellation.withLock { $0 = true }
+                    return
+                }
+                do {
+                    try mutateAfterJournalFence(root: fixture.root, requiredDirectories: [hot.path]) {
+                        try Data(repeating: UInt8(attempt % 251), count: 16).write(to: hot.appendingPathComponent("file-0"))
+                    }
+                    // The index stream delivers independently of the mutation fence's stream.
+                    Thread.sleep(forTimeInterval: 0.1)
+                } catch {
+                    Issue.record(error)
+                    safetyCancellation.withLock { $0 = true }
+                }
+            }, isCancelled: { safetyCancellation.withLock { $0 } })
+        } catch IndexError.unstableFilesystem(let path) {
+            #expect(path == fixture.root.path)
+            reportedInstability = true
+        } catch ScanError.cancelled {
+            reportedCancellation = true
+        }
+        #expect(laterEnumerated.withLock { $0 }, "A repeatedly invalidated shallow directory starves later scan work")
+        #expect(reportedInstability, "Live replays bypassed the scan's bounded convergence limit")
+        #expect(!reportedCancellation, "The scan required safety cancellation instead of reporting an unstable filesystem")
+        #expect(!safetyCancellation.withLock { $0 })
     }
 
     @Test func deletionAfterFirstStreamingBatchDoesNotLeaveAStaleRow() async throws {

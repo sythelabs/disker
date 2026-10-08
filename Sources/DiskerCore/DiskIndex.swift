@@ -70,6 +70,70 @@ public actor DiskIndex {
         return try await pool.read { db in try cacheSummary(db, root: normalized) }
     }
 
+    public nonisolated func changes(root: String) async throws -> AsyncThrowingStream<Void, any Error> {
+        let requested: Data = Data(normalizedRoot(root).utf8)
+        let excluded: [Data] = cacheDirectories
+        let database: DatabasePool = pool
+        let (changes, output): (AsyncThrowingStream<Void, any Error>, AsyncThrowingStream<Void, any Error>.Continuation) = AsyncThrowingStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let (signals, signal): (AsyncStream<Void>, AsyncStream<Void>.Continuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let (attachment, attached): (AsyncThrowingStream<Void, any Error>, AsyncThrowingStream<Void, any Error>.Continuation) = AsyncThrowingStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let producer: Task<Void, Never> = Task.detached(priority: .utility) {
+            defer { signal.finish() }
+            do {
+                try Task.checkCancellation()
+                let locations: Set<Data> = try directoryLocations(path: requested)
+                let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: nil, latency: 0.05, excludedPaths: excluded, receiveChange: { signal.yield(()) })
+                defer { journal.stop() }
+                _ = try journal.replay(timeout: 10, isCancelled: { Task.isCancelled })
+                try Task.checkCancellation()
+                attached.yield(())
+                attached.finish()
+                for await _ in signals {
+                    try Task.checkCancellation()
+                    let replay: JournalReplay = try journal.takePending()
+                    let relevant: Bool
+                    if replay.requiresFullScan { relevant = true }
+                    else {
+                        relevant = try await database.read { db in
+                            let resolved: Data = try resolveCacheAlias(db, path: requested)
+                            var scopes: Set<Data> = locations
+                            scopes.insert(requested)
+                            scopes.insert(resolved)
+                            if let projection: CacheProjection = try cacheProjection(db, path: resolved, viewRoot: resolved) { scopes.formUnion(projection.scopes) }
+                            for path: String in replay.dirtyDirectories {
+                                let mapped: Set<Data> = try journalCachePaths(db, physical: Data(path.utf8))
+                                if mapped.contains(where: { candidate in scopes.contains(where: { cacheContains(candidate, in: $0) }) }) { return true }
+                            }
+                            for path: String in replay.recursiveDirectories {
+                                let mapped: Set<Data> = try journalCachePaths(db, physical: Data(path.utf8))
+                                if mapped.contains(where: { candidate in scopes.contains(where: { cacheContains(candidate, in: $0) || cacheContains($0, in: candidate) }) }) { return true }
+                            }
+                            return false
+                        }
+                    }
+                    if relevant { output.yield(()) }
+                }
+                output.finish()
+            } catch {
+                attached.finish(throwing: error)
+                output.finish(throwing: error)
+            }
+        }
+        output.onTermination = { _ in
+            producer.cancel()
+            signal.finish()
+        }
+        return try await withTaskCancellationHandler {
+            var readiness: AsyncThrowingStream<Void, any Error>.Iterator = attachment.makeAsyncIterator()
+            guard try await readiness.next() != nil else { throw CancellationError() }
+            try Task.checkCancellation()
+            return changes
+        } onCancel: {
+            producer.cancel()
+            signal.finish()
+        }
+    }
+
     public nonisolated func node(root: String, path: Data) async throws -> IndexedNode? {
         let normalized: String = normalizedRoot(root)
         guard cacheContains(path, in: Data(normalized.utf8)) else { return nil }
@@ -195,7 +259,7 @@ public actor DiskIndex {
         let checkpoint: JournalCheckpoint? = try await pool.read { db in
             try Data.fetchOne(db, sql: "SELECT checkpoint FROM cache_state WHERE id=1").map { try JSONDecoder().decode(JournalCheckpoint.self, from: $0) }
         }
-        let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: checkpoint, latency: 0.05)
+        let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: checkpoint, latency: 0.05, excludedPaths: cacheDirectories)
         defer { journal.stop() }
         let replay: JournalReplay = try journal.replay(timeout: 10, isCancelled: isCancelled)
         let rootPath: Data = Data(root.utf8)
@@ -263,13 +327,31 @@ public actor DiskIndex {
         try publishProgress()
         var settled: Bool = false
         for _: Int in 0..<8 {
+            var furthest: Data?
+            var liveReplaysWithoutProgress: Int = 0
             while let path: Data = try await pool.read({ db in
                 try pendingCacheDirectory(db, root: rootPath)
             }) {
                 if isCancelled() { throw ScanError.cancelled }
+                let advances: Bool = furthest.map { previous in
+                    path.count > previous.count || (path.count == previous.count && previous.lexicographicallyPrecedes(path))
+                } ?? true
+                if advances {
+                    furthest = path
+                    liveReplaysWithoutProgress = 0
+                }
                 let report: ScanSummary = try await enumerate(path: path, options: options, receiveEvent: receiveEvent, publishProgress: publishProgress, isCancelled: isCancelled)
                 metrics = addMetrics(metrics, report.metrics)
                 try publishProgress()
+                if liveReplaysWithoutProgress < 8, journal.hasPendingChanges {
+                    liveReplaysWithoutProgress += 1
+                    let pending: JournalReplay = try journal.takePending()
+                    try await pool.write { db in
+                        _ = try beginCacheChanges(db)
+                        try applyCacheReplay(db, replay: pending)
+                        try rebuildCacheTotals(db)
+                    }
+                }
             }
             if isCancelled() { throw ScanError.cancelled }
             let pending: JournalReplay = try journal.drain()

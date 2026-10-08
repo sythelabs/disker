@@ -13,8 +13,12 @@ private func removeJournalFixture(_ root: URL) {
 }
 
 private func deliverJournalEvent(to buffer: JournalEventBuffer, flags: UInt32, eventID: UInt64) {
-    "fixture/file".withCString { path in
-        var pointer: UnsafePointer<CChar> = path
+    deliverJournalEvent(to: buffer, path: "fixture/file", flags: flags, eventID: eventID)
+}
+
+private func deliverJournalEvent(to buffer: JournalEventBuffer, path: String, flags: UInt32, eventID: UInt64) {
+    path.withCString { nativePath in
+        var pointer: UnsafePointer<CChar> = nativePath
         var eventFlags: UInt32 = flags
         var identifier: UInt64 = eventID
         withUnsafeMutablePointer(to: &pointer) { paths in
@@ -25,6 +29,32 @@ private func deliverJournalEvent(to buffer: JournalEventBuffer, flags: UInt32, e
 
 @Suite("File event journal", .serialized)
 struct FileEventJournalTests {
+    @Test(arguments: ["fixture/cache", "fixture/cache/index.sqlite", "fixture/cache/index.sqlite-wal"])
+    func excludedCacheEventsDoNotInvalidateTheirParent(path: String) {
+        let notifications: Mutex<Int> = Mutex(0)
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: false, excludedPaths: [Data("/fixture/cache".utf8)], receiveChange: { notifications.withLock { $0 += 1 } })
+        deliverJournalEvent(to: buffer, path: path, flags: UInt32(kFSEventStreamEventFlagItemIsDir | kFSEventStreamEventFlagItemModified), eventID: 11)
+        #expect(!buffer.hasPendingChanges)
+        #expect(notifications.withLock { $0 } == 0)
+        let replay: JournalReplay = buffer.snapshot()
+        #expect(replay.dirtyDirectories.isEmpty)
+        #expect(replay.recursiveDirectories.isEmpty)
+        #expect(!replay.requiresFullScan)
+        #expect(replay.checkpoint == JournalCheckpoint(journalID: "journal", eventID: 11))
+        deliverJournalEvent(to: buffer, path: "fixture/cache-neighbor/file", flags: UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemModified), eventID: 12)
+        #expect(buffer.hasPendingChanges)
+        #expect(buffer.snapshot().dirtyDirectories == ["/fixture/cache-neighbor"])
+        #expect(!buffer.hasPendingChanges)
+        #expect(notifications.withLock { $0 } == 1)
+    }
+
+    @Test func excludedPathsCannotSuppressDroppedEventReconciliation() {
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: false, excludedPaths: [Data("/fixture/cache".utf8)])
+        deliverJournalEvent(to: buffer, path: "fixture/cache", flags: UInt32(kFSEventStreamEventFlagUserDropped), eventID: 11)
+        #expect(buffer.hasPendingChanges)
+        #expect(buffer.snapshot().requiresFullScan)
+    }
+
     @Test(arguments: [Array(UInt64(11)...25), [UInt64](repeating: 25, count: 15), Array((UInt64(11)...25).reversed())])
     func activeHistoryReplayCanExceedItsInactivityTimeout(eventIDs: [UInt64]) throws {
         let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: true)

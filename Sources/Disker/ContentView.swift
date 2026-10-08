@@ -120,7 +120,7 @@ struct ContentView: View {
             do { clipboardItems = try operations.files(on: .general) }
             catch { fileOperationError = error.localizedDescription }
         }
-        .onDisappear { model.cancelScan() }
+        .onDisappear { model.stop() }
         .onChange(of: model.rootPath) { _, _ in
             model.selection = []
             searchText = ""
@@ -155,8 +155,9 @@ struct ContentView: View {
                             .lineLimit(1)
                             .help(node.lastOpenedDate == nil ? "Date last opened unavailable" : lastOpenedLabel(node.lastOpenedDate))
                     } else {
-                        LastOpenedDateCell(path: node.entry.path, operations: operations)
-                            .id(model.summary?.revision)
+                        LastOpenedDateCell(path: node.entry.path, revision: model.summary?.revision, read: { path in
+                            try await operations.lastOpenedDate(path)
+                        })
                     }
                 }
             }
@@ -471,9 +472,21 @@ struct ContentView: View {
     }
 }
 
-private struct LastOpenedDateCell: View {
+struct LastOpenedDateCell: View {
     let path: Data
-    let operations: FileOperations
+    let revision: Int64?
+    let read: @MainActor (Data) async throws -> Date?
+
+    var body: some View {
+        LastOpenedDateValue(path: path, revision: revision, read: read)
+            .id(path)
+    }
+}
+
+private struct LastOpenedDateValue: View {
+    let path: Data
+    let revision: Int64?
+    let read: @MainActor (Data) async throws -> Date?
     @State private var date: Date?
     @State private var errorMessage: String?
 
@@ -481,9 +494,9 @@ private struct LastOpenedDateCell: View {
         Text(lastOpenedLabel(date))
             .lineLimit(1)
             .help(errorMessage ?? (date == nil ? "Date last opened unavailable" : lastOpenedLabel(date)))
-            .task(id: path) {
+            .task(id: revision) {
                 do {
-                    let opened: Date? = try await operations.lastOpenedDate(path)
+                    let opened: Date? = try await read(path)
                     guard !Task.isCancelled else { return }
                     date = opened
                     errorMessage = nil
