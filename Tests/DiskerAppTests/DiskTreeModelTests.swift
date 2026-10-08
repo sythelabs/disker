@@ -68,8 +68,52 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
 
 @Suite("Disk tree model", .serialized)
 @MainActor struct DiskTreeModelTests {
+    @Test(arguments: [NodeSortColumn.sizeProportion, .allocatedSize, .items], [SortOrder.forward, .reverse])
+    func firstLaunchSortsGrowingBranchesBeforeCommit(column: NodeSortColumn, order: SortOrder) async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let first: URL = fixture.root.appendingPathComponent("a")
+        let second: URL = fixture.root.appendingPathComponent("b")
+        try treeFiles(directory: first, count: 1, bytes: 4_096)
+        try treeFiles(directory: second, count: 2, bytes: 32_768)
+        let root: Data = Data(fixture.root.path.utf8)
+        let firstPath: Data = Data(first.path.utf8)
+        let secondPath: Data = Data(second.path.utf8)
+        let arrived: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        defer { release.signal(); release.signal() }
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            guard case .batch(let entries) = event,
+                  entries.contains(where: { $0.parentPath == firstPath || $0.parentPath == secondPath }) else { return }
+            arrived.signal()
+            if release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing first-launch preview scan") }
+        })
+        if column != .sizeProportion || order != .reverse {
+            model.sortOrder = [DiskTreeSort(sort: NodeSort(column: column, order: order))]
+        }
+        await model.start()
+        for (path, bytes, expected): (Data, UInt64, [DiskTreeRowID]) in [
+            (firstPath, 4_096, [.node(firstPath), .node(secondPath)]),
+            (secondPath, 65_536, [.node(secondPath), .node(firstPath)])
+        ] {
+            try #require(await waitForTreeSignal(arrived, timeout: .now() + 5) == .success)
+            let deadline: Date = Date().addingTimeInterval(5)
+            while model.rows.first(where: { $0.id == .node(path) })?.node?.subtreeLogicalBytes != bytes && Date() < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(model.isScanning)
+            #expect(model.summary == nil)
+            #expect(model.rows.first { $0.id == .node(path) }?.node?.subtreeLogicalBytes == bytes)
+            let ordered: [DiskTreeRowID] = order == .reverse ? expected : expected.reversed()
+            #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == ordered, "First-launch previews must honor the active sort while scanning")
+            release.signal()
+        }
+        try await waitForTreeScan(model)
+        #expect(model.errorMessage == nil)
+    }
+
     @Test(arguments: [NodeSortColumn.sizeProportion, .allocatedSize, .items])
-    func sortedInitialScanKeepsRowsInPlaceUntilCommit(column: NodeSortColumn) async throws {
+    func selectedInitialScanKeepsRowsInPlaceUntilSelectionClears(column: NodeSortColumn) async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
         let first: URL = fixture.root.appendingPathComponent("a")
@@ -95,6 +139,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         await model.sort()
         let initial: [DiskTreeRowID] = model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id)
         try #require(initial.count == 2)
+        model.selection = [initial[0]]
         release.signal()
         try #require(await waitForTreeSignal(arrived, timeout: .now() + 5) == .success)
         let deadline: Date = Date().addingTimeInterval(5)
@@ -103,6 +148,15 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         }
         #expect(model.rows.first { $0.id == .node(Data(first.path.utf8)) }?.node?.subtreeLogicalBytes == 32_768)
         #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == initial, "Growing scan totals moved rows between clicks after selecting a sort column")
+        #expect(model.selection == [initial[0]])
+        model.selection = []
+        let resumed: Date = Date().addingTimeInterval(5)
+        while model.rows.filter({ $0.node?.entry.parentPath == root }).map(\.id) == initial && Date() < resumed {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.isScanning)
+        #expect(model.summary == nil)
+        #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == [.node(Data(second.path.utf8)), .node(Data(first.path.utf8))])
         release.signal()
         try await waitForTreeScan(model)
         #expect(model.rows.filter { $0.node?.entry.parentPath == root }.map(\.id) == [.node(Data(second.path.utf8)), .node(Data(first.path.utf8))])

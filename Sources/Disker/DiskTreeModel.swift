@@ -89,6 +89,7 @@ final class DiskTreeModel {
     private(set) var scanStopped: Bool = false
     private(set) var expanded: Set<Data>
     private(set) var loading: Set<Data> = []
+    var selection: Set<DiskTreeRowID> = []
     var sortOrder: [DiskTreeSort] = [DiskTreeSort(sort: NodeSort(column: .sizeProportion, order: .reverse))]
     private var rootNode: IndexedNode?
     private var pages: [Data: ChildPage] = [:]
@@ -100,7 +101,6 @@ final class DiskTreeModel {
     @ObservationIgnored private var index: DiskIndex?
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored private var sortGeneration: UInt64 = 0
-    @ObservationIgnored private var previewSort: NodeSort?
     @ObservationIgnored private var previewDirectoryTotals: [Data: PreviewTotals] = [:]
     @ObservationIgnored private var scanTask: Task<Void, Never>?
     @ObservationIgnored private var scanBuffer: TreeScanBuffer?
@@ -182,6 +182,7 @@ final class DiskTreeModel {
         scanTask = nil
         scanBuffer = nil
         previewDirectoryTotals = [:]
+        selection = []
         rootPath = path
         expanded = [Data(rootPath.utf8)]
         pages = [:]
@@ -233,10 +234,18 @@ final class DiskTreeModel {
                 while !Task.isCancelled {
                     guard let self else { return }
                     let sorting: UInt64 = self.sortGeneration
-                    let preview: TreeScanPreview = await Task.detached(priority: .utility) {
-                        buffer.snapshot()
-                    }.value
-                    self.applyPreview(preview, ticket: ticket, sorting: sorting)
+                    let sort: NodeSort? = self.sortOrder.first?.sort
+                    do {
+                        let preview: TreeScanPreview = try await Task.detached(priority: .utility) {
+                            let preview: TreeScanPreview = buffer.snapshot()
+                            if let sort, sort.column == .lastOpened { return try preview.sorted(using: sort) }
+                            return preview
+                        }.value
+                        self.applyPreview(preview, ticket: ticket, sorting: sorting)
+                    } catch {
+                        if ticket == self.generation, sorting == self.sortGeneration { self.errorMessage = String(describing: error) }
+                        return
+                    }
                     do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
                 }
             }
@@ -286,13 +295,13 @@ final class DiskTreeModel {
 
     func sort() async {
         sortGeneration += 1
-        previewSort = sortOrder.first?.sort
+        let sort: NodeSort? = sortOrder.first?.sort
         loading = []
         let ticket: UInt64 = generation
         let sorting: UInt64 = sortGeneration
         do {
             if summary == nil {
-                if let buffer: TreeScanBuffer = scanBuffer, let sort: NodeSort = previewSort {
+                if let buffer: TreeScanBuffer = scanBuffer, let sort {
                     let preview: TreeScanPreview = try await Task.detached(priority: .utility) {
                         try buffer.snapshot().sorted(using: sort)
                     }.value
@@ -358,7 +367,9 @@ final class DiskTreeModel {
                 return
             }
             let previous: [IndexedNode] = offset == 0 ? [] : (pages[directory]?.nodes ?? [])
-            pages[directory] = ChildPage(nodes: previous + page.nodes, hasMore: page.hasMore, parentBytes: page.parentBytes)
+            var nodes: [IndexedNode] = previous + page.nodes
+            if summary == nil, selection.isEmpty { nodes.sort(using: sort) }
+            pages[directory] = ChildPage(nodes: nodes, hasMore: page.hasMore, parentBytes: page.parentBytes)
             loading.remove(directory)
         } catch {
             if ticket == generation, sorting == sortGeneration {
@@ -371,7 +382,7 @@ final class DiskTreeModel {
     private func queryPreviewPage(directory: Data, offset: Int) async throws -> ChildPage {
         let limit: Int = pageSize
         let totals: [Data: PreviewTotals] = previewDirectoryTotals
-        let sort: NodeSort? = previewSort
+        let sort: NodeSort? = sortOrder.first?.sort
         return try await Task.detached(priority: .utility) {
             var entries: [ScanEntry] = []
             var count: Int = 0
@@ -425,11 +436,15 @@ final class DiskTreeModel {
         let previous: [IndexedNode] = pages[root.path]?.nodes ?? []
         let paths: Set<Data> = Set(previous.map(\.entry.path))
         let updates: [Data: IndexedNode] = Dictionary(uniqueKeysWithValues: preview.nodes.map { ($0.entry.path, $0) })
-        let rootNodes: [IndexedNode] = previous.map { updates[$0.entry.path] ?? preview.updating($0) }
+        let sort: NodeSort? = selection.isEmpty ? sortOrder.first?.sort : nil
+        var rootNodes: [IndexedNode] = previous.map { updates[$0.entry.path] ?? preview.updating($0) }
             + preview.nodes.filter { !paths.contains($0.entry.path) }
+        if let sort { rootNodes.sort(using: sort) }
         pages[root.path] = ChildPage(nodes: rootNodes, hasMore: preview.rootChildCount > rootNodes.count, parentBytes: preview.totals.allocated)
         for (path, page): (Data, ChildPage) in pages where path != root.path {
-            pages[path] = ChildPage(nodes: page.nodes.map { preview.updating($0) }, hasMore: page.hasMore, parentBytes: max(page.parentBytes, preview.directoryTotals[path]?.allocated ?? 0))
+            var nodes: [IndexedNode] = page.nodes.map { preview.updating($0) }
+            if let sort { nodes.sort(using: sort) }
+            pages[path] = ChildPage(nodes: nodes, hasMore: page.hasMore, parentBytes: max(page.parentBytes, preview.directoryTotals[path]?.allocated ?? 0))
         }
     }
 }
