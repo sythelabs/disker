@@ -2,12 +2,12 @@ import Darwin
 import Dispatch
 import Foundation
 import GRDB
+import Synchronization
 
 public actor DiskIndex {
     private let pool: DatabasePool
     private let cacheDirectories: [Data]
     private let writerLockURL: URL
-    private let pendingScanURL: URL
 
     public nonisolated static func open(databaseURL: URL) async throws -> DiskIndex {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DiskIndex, any Error>) in
@@ -23,7 +23,7 @@ public actor DiskIndex {
         let resolvedDirectory: String = directory.resolvingSymlinksInPath().path
         cacheDirectories = [Data(directory.path.utf8), Data(resolvedDirectory.utf8), Data(try physicalDirectoryPath(resolvedDirectory).utf8)]
         let resolvedDatabase: URL = databaseURL.standardizedFileURL.resolvingSymlinksInPath()
-        pendingScanURL = resolvedDatabase.appendingPathExtension("scan")
+        let pending: URL = resolvedDatabase.appendingPathExtension("scan")
         let lockDirectory: String = try physicalDirectoryPath(resolvedDatabase.deletingLastPathComponent().path)
         writerLockURL = URL(fileURLWithPath: lockDirectory, isDirectory: true).appendingPathComponent(resolvedDatabase.lastPathComponent + ".write-lock", isDirectory: false)
         var configuration: Configuration = Configuration()
@@ -39,62 +39,43 @@ public actor DiskIndex {
         }
         pool = try DatabasePool(path: databaseURL.path, configuration: configuration)
         let version: Int32 = try pool.read { db in try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0 }
-        guard version == 0 || version == 1 else { throw IndexError.incompatibleSchema(version) }
-        if version == 0 {
+        guard (0...cacheSchemaVersion).contains(version) else { throw IndexError.incompatibleSchema(version) }
+        if version != cacheSchemaVersion {
             let opened: DatabasePool = pool
             try bootstrapCacheWithWriterLock(at: writerLockURL, isReady: {
-                let currentVersion: Int32 = try opened.read { db in try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0 }
-                guard currentVersion == 0 || currentVersion == 1 else { throw IndexError.incompatibleSchema(currentVersion) }
-                return currentVersion == 1
+                let current: Int32 = try opened.read { db in try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0 }
+                guard (0...cacheSchemaVersion).contains(current) else { throw IndexError.incompatibleSchema(current) }
+                return current == cacheSchemaVersion
             }, bootstrap: {
                 try opened.write { db in
-                    let currentVersion: Int32 = try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0
-                    guard currentVersion == 0 || currentVersion == 1 else { throw IndexError.incompatibleSchema(currentVersion) }
-                    guard currentVersion == 0 else { return }
-                    try db.execute(sql: """
-                        CREATE TABLE IF NOT EXISTS roots (
-                            root TEXT PRIMARY KEY, revision INTEGER NOT NULL, summary BLOB NOT NULL, checkpoint BLOB
-                        );
-                        CREATE TABLE IF NOT EXISTS nodes (
-                            root TEXT NOT NULL, path BLOB NOT NULL, parent BLOB, name BLOB NOT NULL,
-                            depth INTEGER NOT NULL, directory INTEGER NOT NULL, metadata BLOB NOT NULL,
-                            logical INTEGER NOT NULL, allocated INTEGER NOT NULL,
-                            total_logical INTEGER NOT NULL, total_allocated INTEGER NOT NULL,
-                            total_count INTEGER NOT NULL, seen INTEGER NOT NULL,
-                            modified_revision INTEGER NOT NULL, total_revision INTEGER NOT NULL,
-                            PRIMARY KEY (root, path)
-                        ) WITHOUT ROWID;
-                        CREATE INDEX IF NOT EXISTS node_children ON nodes(root, parent, total_allocated DESC, name);
-                        CREATE INDEX IF NOT EXISTS node_depth ON nodes(root, depth);
-                        CREATE INDEX IF NOT EXISTS node_git_markers ON nodes(root, name);
-                        CREATE TABLE IF NOT EXISTS aliases (
-                            root TEXT NOT NULL, path BLOB NOT NULL, target BLOB NOT NULL, seen INTEGER NOT NULL,
-                            PRIMARY KEY(root,path)
-                        ) WITHOUT ROWID;
-                        CREATE TABLE IF NOT EXISTS git_cache (
-                            root TEXT NOT NULL, path TEXT NOT NULL, revision INTEGER NOT NULL,
-                            fingerprint BLOB NOT NULL, info BLOB NOT NULL, PRIMARY KEY(root, path)
-                        ) WITHOUT ROWID;
-                        PRAGMA user_version=1;
-                        """)
+                    let current: Int32 = try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0
+                    guard current != cacheSchemaVersion else { return }
+                    try migrateFilesystemCache(db, pendingURL: pending)
                 }
             })
         }
     }
 
+    public nonisolated func cachedProgress(root: String) async throws -> IndexProgress? {
+        let normalized: String = normalizedRoot(root)
+        return try await pool.read { db in try cacheProgress(db, root: normalized, elapsed: 0) }
+    }
+
+    private nonisolated func repositoryRevision(path: String) async throws -> Int64? {
+        try await pool.read { db in try Int64.fetchOne(db, sql: "SELECT total_revision FROM nodes WHERE path=?", arguments: [Data(path.utf8)]) }
+    }
+
     public nonisolated func cachedSummary(root: String) async throws -> IndexSummary? {
         let normalized: String = normalizedRoot(root)
-        return try await pool.read { db in try loadSummary(db: db, root: normalized) }
+        return try await pool.read { db in try cacheSummary(db, root: normalized) }
     }
 
     public nonisolated func node(root: String, path: Data) async throws -> IndexedNode? {
         let normalized: String = normalizedRoot(root)
+        guard cacheContains(path, in: Data(normalized.utf8)) else { return nil }
         return try await pool.read { db in
-            let query: String = "SELECT *, (SELECT target FROM aliases a WHERE a.root=nodes.root AND a.path=nodes.path) AS alias_target FROM nodes WHERE root=? AND path=?"
-            if let row: Row = try Row.fetchOne(db, sql: query, arguments: [normalized, path]) { return try decodeNode(row) }
-            let resolved: Data = try resolveAliasPath(db: db, root: normalized, path: path)
-            guard let row: Row = try Row.fetchOne(db, sql: query, arguments: [normalized, resolved]) else { return nil }
-            return try decodeNode(row)
+            guard let node: IndexedNode = try cacheNode(db, path: path) else { return nil }
+            return try projectCacheNode(db, node: node, viewRoot: Data(normalized.utf8))
         }
     }
 
@@ -105,6 +86,7 @@ public actor DiskIndex {
     public nonisolated func children(root: String, directory: Data, offset: Int, limit: Int, sort: NodeSort) async throws -> [IndexedNode] {
         guard offset >= 0, limit > 0, limit <= 10_000 else { throw IndexError.invalidQuery("offset must be >= 0 and limit must be 1 through 10000") }
         let normalized: String = normalizedRoot(root)
+        guard cacheContains(directory, in: Data(normalized.utf8)) else { throw IndexError.invalidQuery("Directory is outside the selected folder: \(normalized)") }
         let direction: String = sort.order == .forward ? "ASC" : "DESC"
         let names: String = "CAST(name AS TEXT) COLLATE finder_name, name, path"
         let ordering: String
@@ -124,9 +106,11 @@ public actor DiskIndex {
             opened = "file_last_opened(path)"
         }
         return try await pool.read { db in
-            let resolved: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
-            return try Row.fetchAll(db, sql: "SELECT *, \(opened) AS last_opened, (SELECT target FROM aliases a WHERE a.root=nodes.root AND a.path=nodes.path) AS alias_target FROM nodes INDEXED BY node_children WHERE root=? AND parent=? ORDER BY \(ordering) LIMIT ? OFFSET ?", arguments: [normalized, resolved, limit, offset]).map { row in
-                let node: IndexedNode = try decodeNode(row)
+            let resolved: Data = try resolveCacheAlias(db, path: directory)
+            let hasAliases: Bool = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM aliases)")!
+            return try Row.fetchAll(db, sql: "SELECT *, \(opened) AS last_opened, (SELECT target FROM aliases a WHERE a.path=nodes.path) AS alias_target FROM nodes INDEXED BY node_children WHERE parent=? ORDER BY \(ordering) LIMIT ? OFFSET ?", arguments: [resolved, limit, offset]).map { row in
+                let decoded: IndexedNode = try decodeCacheNode(row)
+                let node: IndexedNode = hasAliases ? try projectCacheNode(db, node: decoded, viewRoot: Data(normalized.utf8)) : decoded
                 let timestamp: Double? = row["last_opened"]
                 return IndexedNode(entry: node.entry, subtreeLogicalBytes: node.subtreeLogicalBytes, subtreeAllocatedBytes: node.subtreeAllocatedBytes, subtreeNodeCount: node.subtreeNodeCount, aliasTargetPath: node.aliasTargetPath, lastOpenedDate: timestamp.map { Date(timeIntervalSince1970: $0) })
             }
@@ -137,7 +121,8 @@ public actor DiskIndex {
         guard offset >= 0, limit > 0, limit <= 10_000 else { throw IndexError.invalidQuery("Invalid Git candidate page") }
         let normalized: String = normalizedRoot(root)
         return try await pool.read { db in
-            let paths: [Data] = try Data.fetchAll(db, sql: "SELECT parent FROM nodes WHERE root=? AND name=? ORDER BY path LIMIT ? OFFSET ?", arguments: [normalized, Data(".git".utf8), limit, offset])
+            let (lower, upper): (Data, Data) = cacheRange(Data(normalized.utf8))
+            let paths: [Data] = try Data.fetchAll(db, sql: "SELECT parent FROM nodes WHERE name=? AND path>=? AND path<? ORDER BY path LIMIT ? OFFSET ?", arguments: [Data(".git".utf8), lower, upper, limit, offset])
             return try paths.map { path in
                 guard let value: String = String(data: path, encoding: .utf8) else { throw IndexError.invalidQuery("Git requires a UTF-8 repository path") }
                 return value
@@ -147,7 +132,7 @@ public actor DiskIndex {
 
     public func gitInfo(root: String, path: String, inspector: GitInspector) async throws -> CachedGitInfo? {
         let normalized: String = normalizedRoot(root)
-        guard let summary: IndexSummary = try await cachedSummary(root: normalized) else { throw IndexError.invalidQuery("Scan this root before Git enrichment") }
+        guard try await cachedSummary(root: normalized) != nil else { throw IndexError.invalidQuery("Scan this root before Git enrichment") }
         let fingerprint: GitInputFingerprint? = try await Task.detached(priority: .utility) {
             try inspector.fingerprint(path: path)
         }.value
@@ -162,30 +147,29 @@ public actor DiskIndex {
             throw IndexError.invalidQuery("Repository is outside the indexed root: \(fingerprint.rootPath)")
         }
         let snapshotRevision: Int64 = try await pool.read { db in
-            guard let revision: Int64 = try Int64.fetchOne(db, sql: "SELECT total_revision FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(repositoryPath.utf8)]) else { throw IndexError.invalidQuery("Repository is absent from the cached tree: \(repositoryPath)") }
+            guard let revision: Int64 = try Int64.fetchOne(db, sql: "SELECT total_revision FROM nodes WHERE path=?", arguments: [Data(repositoryPath.utf8)]) else { throw IndexError.invalidQuery("Repository is absent from the cached tree: \(repositoryPath)") }
             return revision
         }
         let cached: GitRepositoryInfo? = try await pool.read { db in
-            guard let row: Row = try Row.fetchOne(db, sql: "SELECT revision,fingerprint,info FROM git_cache WHERE root=? AND path=?", arguments: [normalized, repositoryPath]), row["revision"] as Int64 == snapshotRevision else { return nil }
+            guard let row: Row = try Row.fetchOne(db, sql: "SELECT revision,fingerprint,info FROM git_cache WHERE path=?", arguments: [repositoryPath]), row["revision"] as Int64 == snapshotRevision else { return nil }
             let saved: GitInputFingerprint = try JSONDecoder().decode(GitInputFingerprint.self, from: row["fingerprint"])
             guard saved == fingerprint else { return nil }
             return try JSONDecoder().decode(GitRepositoryInfo.self, from: row["info"])
         }
         if let cached {
-            guard try await cachedSummary(root: normalized)?.revision == summary.revision else { throw IndexError.staleEnrichment(repositoryPath) }
+            guard try await self.repositoryRevision(path: repositoryPath) == snapshotRevision else { throw IndexError.staleEnrichment(repositoryPath) }
             return CachedGitInfo(info: cached, wasCached: true)
         }
         let enriched: (GitRepositoryInfo?, GitInputFingerprint?) = try await Task.detached(priority: .utility) {
             (try inspector.inspect(path: path), try inspector.fingerprint(path: path))
         }.value
         guard let info: GitRepositoryInfo = enriched.0 else { return nil }
-        guard enriched.1 == fingerprint, try await cachedSummary(root: normalized)?.revision == summary.revision else { throw IndexError.staleEnrichment(repositoryPath) }
+        guard enriched.1 == fingerprint, try await self.repositoryRevision(path: repositoryPath) == snapshotRevision else { throw IndexError.staleEnrichment(repositoryPath) }
         try await withCacheWriterLock(at: writerLockURL, isCancelled: { Task.isCancelled }, onWait: {}) {
             try await self.pool.write { db in
-                let currentRevision: Int64? = try Int64.fetchOne(db, sql: "SELECT total_revision FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(repositoryPath.utf8)])
+                let currentRevision: Int64? = try Int64.fetchOne(db, sql: "SELECT total_revision FROM nodes WHERE path=?", arguments: [Data(repositoryPath.utf8)])
                 guard currentRevision == snapshotRevision else { throw IndexError.staleEnrichment(repositoryPath) }
-                guard try Int64.fetchOne(db, sql: "SELECT revision FROM roots WHERE root=?", arguments: [normalized]) == summary.revision else { throw IndexError.staleEnrichment(repositoryPath) }
-                try db.execute(sql: "INSERT INTO git_cache(root,path,revision,fingerprint,info) VALUES(?,?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET revision=excluded.revision,fingerprint=excluded.fingerprint,info=excluded.info", arguments: [normalized, repositoryPath, snapshotRevision, try JSONEncoder().encode(fingerprint), try JSONEncoder().encode(info)])
+                try db.execute(sql: "INSERT INTO git_cache(path,revision,fingerprint,info) VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET revision=excluded.revision,fingerprint=excluded.fingerprint,info=excluded.info", arguments: [repositoryPath, snapshotRevision, try JSONEncoder().encode(fingerprint), try JSONEncoder().encode(info)])
             }
         }
         return CachedGitInfo(info: info, wasCached: false)
@@ -193,427 +177,252 @@ public actor DiskIndex {
 
     public func refresh(root: String, mode: RefreshMode, receiveEvent: @escaping @Sendable (IndexEvent) -> Void, isCancelled: @escaping @Sendable () -> Bool) async throws -> IndexSummary {
         let normalized: String = normalizedRoot(root)
+        let requested: Data = Data(normalized.utf8)
         if case .directories(let directories) = mode {
-            let rootPath: Data = Data(normalized.utf8)
-            guard directories.allSatisfy({ $0 == rootPath || isDescendant($0, of: rootPath) }) else {
-                throw IndexError.invalidQuery("Changed directories must be inside the indexed root: \(normalized)")
-            }
+            guard directories.allSatisfy({ cacheContains($0, in: requested) }) else { throw IndexError.invalidQuery("Changed directories must be inside the selected folder: \(normalized)") }
         }
-        let cachedAtStart: IndexSummary? = try await cachedSummary(root: normalized)
-        receiveEvent(.started(cached: cachedAtStart))
+        let cached: IndexSummary? = try await cachedSummary(root: normalized)
+        receiveEvent(.started(cached: cached))
         if isCancelled() { throw ScanError.cancelled }
-        let exclusions: [Data] = cacheDirectories
-        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: normalized == "/" ? .crossDevices : .sameDevice, excludedPaths: exclusions)
-        let start: ContinuousClock.Instant = ContinuousClock.now
-        let result: (summary: IndexSummary, progress: IndexProgress) = try await withCacheWriterLock(at: writerLockURL, isCancelled: isCancelled, onWait: { receiveEvent(.waitingForWriter) }) {
+        return try await withCacheWriterLock(at: writerLockURL, isCancelled: isCancelled, onWait: { receiveEvent(.waitingForWriter) }) {
             receiveEvent(.writerAcquired)
-            let pendingScan: PendingScan = try PendingScan(databaseURL: self.pendingScanURL, root: normalized)
-            let result: (summary: IndexSummary, progress: IndexProgress) = try await self.pool.write { db in
-                let cached: IndexSummary? = try loadSummary(db: db, root: normalized)
-                let revision: Int64 = (cached?.revision ?? 0) + 1
-                let rootMetadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(normalized.utf8))
-                let pendingCheckpoint: JournalCheckpoint? = try pendingScan.checkpoint(revision: revision, metadata: rootMetadata, options: options)
-                let hasPendingScan: Bool = try pendingScan.exists()
-                let checkpointData: Data? = try Data.fetchOne(db, sql: "SELECT checkpoint FROM roots WHERE root=?", arguments: [normalized])
-                let checkpoint: JournalCheckpoint? = try checkpointData.map { try JSONDecoder().decode(JournalCheckpoint.self, from: $0) }
-                let journal: FileEventJournal
-                do {
-                    journal = try FileEventJournal(rootPath: normalized, checkpoint: hasPendingScan ? pendingCheckpoint : checkpoint, latency: 0.05)
-                } catch FileEventJournalError.filesystem(let operation, let path, let code) {
-                    throw ScanError.systemCall(path: Data(path.utf8), operation: operation, errnoCode: code)
-                }
-                defer { journal.stop() }
-                let replay: JournalReplay = try journal.replay(timeout: 10, isCancelled: isCancelled)
-                var rootChanged: Bool = false
-                if let previous: Data = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(normalized.utf8)]) {
-                    let saved: FileMetadata = try decodeMetadata(previous)
-                    var live: stat = stat()
-                    guard stat(normalized, &live) == 0 else { throw ScanError.systemCall(path: Data(normalized.utf8), operation: "stat", errnoCode: errno) }
-                    rootChanged = saved.device != UInt64(UInt32(bitPattern: live.st_dev)) || saved.inode != UInt64(live.st_ino) || saved.birthTime.seconds != Int64(live.st_birthtimespec.tv_sec) || saved.birthTime.nanoseconds != Int32(live.st_birthtimespec.tv_nsec)
-                }
-                try db.execute(sql: "CREATE TEMP TABLE IF NOT EXISTS dirty(path BLOB PRIMARY KEY, depth INTEGER NOT NULL) WITHOUT ROWID; DELETE FROM dirty")
-                var metrics: ScanMetrics = ScanMetrics(entries: 0, directories: 0, bulkCalls: 0, metadataCalls: 0, contentBytesRead: 0)
-                var issues: [ScanIssue] = []
-                var observed: Int64 = 0
-                var logicalObserved: UInt64 = 0
-                var allocatedObserved: UInt64 = 0
-                var completionFraction: Double = 0
-                var lastProgressFraction: Double = -1
-                var lastProgressElapsed: Double = 0
-                var currentCheckpoint: JournalCheckpoint? = replay.checkpoint
-                func publishProgress() {
-                    let elapsed: Double = elapsedSeconds(start)
-                    lastProgressFraction = completionFraction
-                    lastProgressElapsed = elapsed
-                    receiveEvent(.progress(IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsed, previousNodeCount: cached?.nodeCount, completionFraction: completionFraction)))
-                }
-                func advanceProgress(_ weight: Double) {
-                    completionFraction = min(Double(1).nextDown, completionFraction + weight)
-                    if completionFraction - lastProgressFraction >= 0.002 || elapsedSeconds(start) - lastProgressElapsed >= 0.1 {
-                        publishProgress()
-                    }
-                }
-                // APFS directory link counts can vary between metadata queries; exclude them and access times from revisions.
-                let upsert: Statement = try db.makeStatement(sql: """
-                    INSERT INTO nodes(root,path,parent,name,depth,directory,metadata,logical,allocated,total_logical,total_allocated,total_count,seen,modified_revision,total_revision)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
-                    ON CONFLICT(root,path) DO UPDATE SET parent=excluded.parent,name=excluded.name,depth=excluded.depth,
-                        directory=excluded.directory,metadata=excluded.metadata,logical=excluded.logical,
-                        allocated=excluded.allocated,seen=excluded.seen,
-                        total_logical=CASE WHEN excluded.directory=0 THEN excluded.logical ELSE nodes.total_logical END,
-                        total_allocated=CASE WHEN excluded.directory=0 THEN excluded.allocated ELSE nodes.total_allocated END,
-                        total_count=CASE WHEN excluded.directory=0 THEN 1 ELSE nodes.total_count END,
-                        modified_revision=CASE WHEN substr(nodes.metadata,1,24)<>substr(excluded.metadata,1,24)
-                            OR (excluded.directory=0 AND substr(nodes.metadata,25,8)<>substr(excluded.metadata,25,8))
-                            OR substr(nodes.metadata,33,88)<>substr(excluded.metadata,33,88)
-                            OR substr(nodes.metadata,137)<>substr(excluded.metadata,137) THEN excluded.modified_revision ELSE nodes.modified_revision END,
-                        total_revision=CASE WHEN excluded.directory=0 AND (substr(nodes.metadata,1,120)<>substr(excluded.metadata,1,120) OR substr(nodes.metadata,137)<>substr(excluded.metadata,137)) THEN excluded.total_revision ELSE nodes.total_revision END
-                    """)
-                let markDirty: Statement = try db.makeStatement(sql: "INSERT OR IGNORE INTO dirty(path,depth) VALUES(?,?)")
-                let previousDirectory: Statement = try db.makeStatement(sql: "SELECT directory FROM nodes WHERE root=? AND path=?")
-                func persist(_ batch: [ScanEntry]) throws {
-                    for entry: ScanEntry in batch {
-                        let directory: Bool = entry.metadata.kind == .directory
-                        let logical: UInt64 = directory ? 0 : entry.metadata.logicalBytes
-                        guard logical <= Int64.max, entry.metadata.allocatedBytes <= Int64.max else { throw IndexError.malformedCache("File size exceeds SQLite integer range") }
-                        if !directory, let wasDirectory: Bool = try Bool.fetchOne(previousDirectory, arguments: [normalized, entry.path]), wasDirectory {
-                            let (lower, upper): (Data, Data) = prefixRange(entry.path)
-                            try db.execute(sql: "DELETE FROM nodes WHERE root=? AND path>=? AND path<?", arguments: [normalized, lower, upper])
-                            try db.execute(sql: "DELETE FROM aliases WHERE root=? AND (path=? OR (path>=? AND path<?) OR target=? OR (target>=? AND target<?))", arguments: [normalized, entry.path, lower, upper, entry.path, lower, upper])
-                            issues.removeAll { $0.path == entry.path || isDescendant($0.path, of: entry.path) }
-                        }
-                        let parent: Data? = entry.path == Data(normalized.utf8) ? nil : (entry.parentPath ?? parentPath(entry.path))
-                        try upsert.execute(arguments: [normalized, entry.path, parent, entry.name, pathDepth(entry.path), directory, encodeMetadata(entry.metadata), Int64(logical), Int64(entry.metadata.allocatedBytes), Int64(logical), Int64(entry.metadata.allocatedBytes), revision, revision, revision])
-                        if directory { try markDirty.execute(arguments: [entry.path, pathDepth(entry.path)]) }
-                        if let parent { try markDirty.execute(arguments: [parent, pathDepth(parent)]) }
-                        observed += 1
-                        logicalObserved += logical
-                        allocatedObserved += entry.metadata.allocatedBytes
-                    }
-                }
-                func apply(_ batch: [ScanEntry]) throws {
-                    try persist(batch)
-                    receiveEvent(.batch(batch))
-                    publishProgress()
-                }
-                func scanTree(_ path: Data, progressWeight: Double) throws {
-                    try resetSeen(db: db, root: normalized, path: path)
-                    let summary: ScanSummary
-                    do {
-                        var previousFraction: Double = 0
-                        summary = try DirectoryScanner.scan(root: path, options: options, isCancelled: isCancelled, receiveProgress: { fraction in
-                            let increment: Double = max(0, fraction - previousFraction)
-                            previousFraction = max(previousFraction, fraction)
-                            advanceProgress(progressWeight * increment)
-                        }, receiveBatch: apply)
-                    } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
-                        try scanDirectory(parentPath(path), progressWeight: progressWeight)
-                        return
-                    } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
-                        let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
-                        issues.removeAll { $0.path == failedPath }
-                        issues.append(issue)
-                        try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
-                        advanceProgress(progressWeight)
-                        return
-                    }
-                    metrics = addMetrics(metrics, summary.metrics)
-                    issues.removeAll { $0.path == path || isDescendant($0.path, of: path) }
-                    issues += summary.issues
-                    for alias: ScanAlias in summary.aliases {
-                        try db.execute(sql: "INSERT INTO aliases(root,path,target,seen) VALUES(?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET target=excluded.target,seen=excluded.seen", arguments: [normalized, alias.aliasPath, alias.targetPath, revision])
-                    }
-                    try preserveUnreachable(db: db, root: normalized, issues: summary.issues, revision: revision)
-                    try markRemovedParents(db: db, root: normalized, path: path, revision: revision)
-                    try removeUnseen(db: db, root: normalized, path: path, revision: revision)
-                    try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
-                }
-                func scanDirectory(_ path: Data, progressWeight: Double) throws {
-                    if exclusions.contains(where: { excludedPath(path, directory: $0) }) { advanceProgress(progressWeight); return }
-                    let existing: Row? = try Row.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path])
-                    guard existing != nil else { try scanTree(path, progressWeight: progressWeight); return }
-                    try db.execute(sql: "UPDATE nodes SET seen=0 WHERE root=? AND path=?", arguments: [normalized, path])
-                    try db.execute(sql: "UPDATE nodes INDEXED BY node_children SET seen=0 WHERE root=? AND parent=?", arguments: [normalized, path])
-                    var newDirectories: [Data] = []
-                    let summary: ScanSummary
-                    do {
-                        summary = try DirectoryScanner.enumerateDirectory(path: path, options: options, isCancelled: isCancelled, receiveProgress: { _ in }) { batch in
-                            for entry: ScanEntry in batch where entry.metadata.kind == .directory && entry.path != path {
-                                let previous: Data? = try Data.fetchOne(db, sql: "SELECT metadata FROM nodes WHERE root=? AND path=?", arguments: [normalized, entry.path])
-                                if let previous {
-                                    let metadata: FileMetadata = try decodeMetadata(previous)
-                                    if metadata.kind != .directory || metadata.device != entry.metadata.device || metadata.inode != entry.metadata.inode { newDirectories.append(entry.path) }
-                                } else { newDirectories.append(entry.path) }
-                            }
-                            try apply(batch)
-                        }
-                    } catch ScanError.systemCall(_, _, let code) where (code == ENOENT || code == ENOTDIR) && path != Data(normalized.utf8) {
-                        try scanDirectory(parentPath(path), progressWeight: progressWeight)
-                        return
-                    } catch ScanError.systemCall(let failedPath, let operation, let code) where (code == EACCES || code == EPERM) && path != Data(normalized.utf8) {
-                        let issue: ScanIssue = ScanIssue(kind: .permissionDenied, path: failedPath, operation: operation, errnoCode: code)
-                        issues.removeAll { $0.path == failedPath }
-                        issues.append(issue)
-                        try preserveUnreachable(db: db, root: normalized, issues: [issue], revision: revision)
-                        advanceProgress(progressWeight)
-                        return
-                    }
-                    metrics = addMetrics(metrics, summary.metrics)
-                    issues.removeAll { issue in
-                        issue.path == path || (parentPath(issue.path) == path && [.metadataUnavailable, .vanished].contains(issue.kind))
-                    }
-                    issues += summary.issues
-                    try preserveUnreachable(db: db, root: normalized, issues: summary.issues, revision: revision)
-                    let stale: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM nodes INDEXED BY node_children WHERE root=? AND parent=? AND seen<>?", arguments: [normalized, path, revision])
-                    for obsolete: Data in stale {
-                        try removeTree(db: db, root: normalized, path: obsolete, revision: revision)
-                        issues.removeAll { $0.path == obsolete || isDescendant($0.path, of: obsolete) }
-                    }
-                    let childWeight: Double = progressWeight / Double(newDirectories.count + 1)
-                    advanceProgress(childWeight)
-                    for child: Data in newDirectories { try scanTree(child, progressWeight: childWeight) }
-                    try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
-                }
-                func reconcile(_ update: JournalReplay, progressWeight: Double) throws {
-                    let recursive: [Data] = minimalPaths(try update.recursiveDirectories.map { try resolveAliasPath(db: db, root: normalized, path: Data($0.utf8)) }.filter { path in !exclusions.contains(where: { excludedPath(path, directory: $0) }) })
-                    advanceProgress(Double(update.recursiveDirectories.count - recursive.count) * progressWeight)
-                    for path: Data in recursive {
-                        if isCancelled() { throw ScanError.cancelled }
-                        var metadata: stat = stat()
-                        let exists: Int32 = path.withUnsafeBytes { bytes in
-                            var terminated: [UInt8] = Array(bytes)
-                            terminated.append(0)
-                            return terminated.withUnsafeBytes { lstat($0.baseAddress!.assumingMemoryBound(to: CChar.self), &metadata) }
-                        }
-                        if exists != 0 && errno == ENOENT {
-                            try removeTree(db: db, root: normalized, path: path, revision: revision)
-                            issues.removeAll { $0.path == path || isDescendant($0.path, of: path) }
-                            try markAncestors(db: db, path: path, rootPath: Data(normalized.utf8))
-                            advanceProgress(progressWeight)
-                        } else if exists == 0 && metadata.st_mode & S_IFMT == S_IFDIR {
-                            try scanTree(path, progressWeight: progressWeight)
-                        } else {
-                            let parent: Data = parentPath(path)
-                            try scanDirectory(parent, progressWeight: progressWeight)
-                        }
-                    }
-                    for directory: String in update.dirtyDirectories {
-                        let path: Data = try resolveAliasPath(db: db, root: normalized, path: Data(directory.utf8))
-                        if !recursive.contains(where: { path == $0 || isDescendant(path, of: $0) }) {
-                            try scanDirectory(path, progressWeight: progressWeight)
-                        } else {
-                            advanceProgress(progressWeight)
-                        }
-                    }
-                }
-                if mode == .full || cached == nil || replay.requiresFullScan || rootChanged || hasPendingScan {
-                    try pendingScan.prepare(revision: revision, metadata: rootMetadata, options: options, replay: replay)
-                    let staged: ScanSummary = try pendingScan.run(options: options, metadata: rootMetadata, previousNodeCount: cached?.nodeCount, start: start, receiveEvent: receiveEvent, isCancelled: isCancelled)
-                    let path: Data = Data(normalized.utf8)
-                    try resetSeen(db: db, root: normalized, path: path)
-                    try pendingScan.replay(isCancelled: isCancelled, receiveBatch: persist)
-                    metrics = staged.metrics
-                    issues = staged.issues
-                    for alias: ScanAlias in staged.aliases {
-                        try db.execute(sql: "INSERT INTO aliases(root,path,target,seen) VALUES(?,?,?,?) ON CONFLICT(root,path) DO UPDATE SET target=excluded.target,seen=excluded.seen", arguments: [normalized, alias.aliasPath, alias.targetPath, revision])
-                    }
-                    try preserveUnreachable(db: db, root: normalized, issues: staged.issues, revision: revision)
-                    try markRemovedParents(db: db, root: normalized, path: path, revision: revision)
-                    try removeUnseen(db: db, root: normalized, path: path, revision: revision)
-                    try markAncestors(db: db, path: path, rootPath: path)
-                    completionFraction = 0.95
-                    publishProgress()
-                } else {
-                    issues = cached?.issues ?? []
-                    let directories: [Data]
-                    if case .directories(let paths) = mode { directories = minimalPaths(paths) } else { directories = [] }
-                    let scopeCount: Int = replay.recursiveDirectories.count + replay.dirtyDirectories.count + directories.count
-                    let progressWeight: Double = scopeCount == 0 ? 0 : 0.95 / Double(scopeCount)
-                    try reconcile(replay, progressWeight: progressWeight)
-                    for directory: Data in directories {
-                        let path: Data = try resolveAliasPath(db: db, root: normalized, path: directory)
-                        try scanDirectory(path, progressWeight: progressWeight)
-                    }
-                    let retryPaths: [Data] = minimalPaths(issues.filter { [.metadataUnavailable, .ioError, .changedDuringScan, .vanished].contains($0.kind) }.map(\.path))
-                    if !retryPaths.isEmpty {
-                        let retryWeight: Double = (1 - completionFraction) * 0.95 / Double(retryPaths.count)
-                        for path: Data in retryPaths {
-                            if try Bool.fetchOne(db, sql: "SELECT directory FROM nodes WHERE root=? AND path=?", arguments: [normalized, path]) == true {
-                                try scanTree(path, progressWeight: retryWeight)
-                            } else {
-                                try scanDirectory(parentPath(path), progressWeight: retryWeight)
-                            }
-                        }
-                    }
-                }
-                var settled: Bool = false
-                for _: Int in 0..<8 {
-                    let pending: JournalReplay = try journal.drain()
-                    currentCheckpoint = pending.checkpoint
-                    if pending.requiresFullScan {
-                        try scanTree(Data(normalized.utf8), progressWeight: (1 - completionFraction) * 0.95)
-                    } else if pending.dirtyDirectories.isEmpty && pending.recursiveDirectories.isEmpty {
-                        settled = true
-                        break
-                    } else {
-                        let scopeCount: Int = pending.recursiveDirectories.count + pending.dirtyDirectories.count
-                        let progressWeight: Double = (1 - completionFraction) * 0.95 / Double(scopeCount)
-                        try reconcile(pending, progressWeight: progressWeight)
-                    }
-                }
-                guard settled else { throw IndexError.unstableFilesystem(normalized) }
-                if isCancelled() { throw ScanError.cancelled }
-                try rebuildAggregates(db: db, root: normalized)
-                guard let row: Row = try Row.fetchOne(db, sql: "SELECT total_logical,total_allocated,total_count FROM nodes WHERE root=? AND path=?", arguments: [normalized, Data(normalized.utf8)]) else { throw IndexError.malformedCache("Root node missing after scan") }
-                let blockingIssues: [ScanIssue] = issues.filter { $0.kind != .excluded && $0.kind != .directoryAlias && $0.kind != .mountBoundary }
-                let summary: IndexSummary = IndexSummary(root: normalized, logicalBytes: UInt64(row["total_logical"] as Int64), allocatedBytes: UInt64(row["total_allocated"] as Int64), nodeCount: row["total_count"], revision: revision, lastScanDate: Date(), isComplete: blockingIssues.isEmpty, issues: issues, metrics: metrics)
-                try db.execute(sql: "INSERT INTO roots(root,revision,summary,checkpoint) VALUES(?,?,?,?) ON CONFLICT(root) DO UPDATE SET revision=excluded.revision,summary=excluded.summary,checkpoint=excluded.checkpoint", arguments: [normalized, revision, try JSONEncoder().encode(summary), try currentCheckpoint.map { try JSONEncoder().encode($0) }])
-                return (summary: summary, progress: IndexProgress(entriesObserved: observed, logicalBytesObserved: logicalObserved, allocatedBytesObserved: allocatedObserved, elapsedSeconds: elapsedSeconds(start), previousNodeCount: cached?.nodeCount, completionFraction: 1))
-            }
-            try pendingScan.discard()
-            return result
+            return try await self.scan(root: normalized, mode: mode, receiveEvent: receiveEvent, isCancelled: isCancelled)
         }
-        receiveEvent(.progress(result.progress))
-        receiveEvent(.completed(result.summary))
-        return result.summary
+    }
+
+    private func scan(root: String, mode: RefreshMode, receiveEvent: @escaping @Sendable (IndexEvent) -> Void, isCancelled: @escaping @Sendable () -> Bool) async throws -> IndexSummary {
+        let start: ContinuousClock.Instant = .now
+        let checkpoint: JournalCheckpoint? = try await pool.read { db in
+            try Data.fetchOne(db, sql: "SELECT checkpoint FROM cache_state WHERE id=1").map { try JSONDecoder().decode(JournalCheckpoint.self, from: $0) }
+        }
+        let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: checkpoint, latency: 0.05)
+        defer { journal.stop() }
+        let replay: JournalReplay = try journal.replay(timeout: 10, isCancelled: isCancelled)
+        let rootPath: Data = Data(root.utf8)
+        var ancestors: [ScanEntry] = []
+        var current: Data? = rootPath
+        while let path: Data = current {
+            let metadata: FileMetadata
+            do { metadata = try DirectoryScanner.directoryMetadata(path: path) }
+            catch ScanError.systemCall(_, _, let code) where path != rootPath && code == ENOTDIR {
+                var native: stat = stat()
+                let result: Int32 = (path + Data([0])).withUnsafeBytes { lstat($0.baseAddress!.assumingMemoryBound(to: CChar.self), &native) }
+                guard result == 0 else { throw ScanError.systemCall(path: path, operation: "lstat ancestor", errnoCode: errno) }
+                guard native.st_mode & S_IFMT == S_IFLNK else { throw ScanError.systemCall(path: path, operation: "open ancestor", errnoCode: code) }
+                break
+            }
+            ancestors.append(ScanEntry(path: path, parentPath: cacheParent(path), name: path == Data("/".utf8) ? path : Data(path.suffix(from: path.lastIndex(of: 47)!.advanced(by: 1))), metadata: metadata))
+            current = cacheParent(path)
+        }
+        let physicalRoots: Set<Data> = try directoryLocations(path: rootPath)
+        let entries: [ScanEntry] = ancestors
+        try await pool.write { db in
+            let revision: Int64 = try beginCacheChanges(db)
+            for entry: ScanEntry in entries.reversed() {
+                let exists: Bool = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM nodes WHERE path=?)", arguments: [entry.path])!
+                if entry.path == rootPath || !exists {
+                    try recordCacheEntries(db, entries: [entry], directory: nil, epoch: 0, revision: revision)
+                }
+            }
+            try storeDirectoryLocations(db, path: rootPath, locations: physicalRoots)
+            try applyCacheReplay(db, replay: replay)
+            switch mode {
+            case .full: try invalidateCacheSubtree(db, path: rootPath)
+            case .directories(let paths):
+                for path: Data in paths { try invalidateCacheListing(db, path: path) }
+            case .automatic: break
+            }
+            let resolved: Data = try resolveCacheAlias(db, path: rootPath)
+            let scopes: [Data] = try cacheProjection(db, path: resolved, viewRoot: resolved)?.scopes ?? [resolved]
+            for scope: Data in scopes {
+                let (lower, upper): (Data, Data) = cacheRange(scope)
+                let retries: [Data] = try Data.fetchAll(db, sql: """
+                    SELECT path FROM directories WHERE done=1 AND report IS NOT NULL AND (path=? OR (path>=? AND path<?)) AND EXISTS(
+                        SELECT 1 FROM json_each(CAST(report AS TEXT),'$.issues') WHERE json_extract(value,'$.kind') IN
+                        ('permissionDenied','vanished','metadataUnavailable','ioError','changedDuringScan'))
+                    """, arguments: [scope, lower, upper])
+                for path: Data in retries { try invalidateCacheListing(db, path: path) }
+            }
+            try rebuildCacheTotals(db)
+        }
+        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .crossDevices, excludedPaths: cacheDirectories)
+        var metrics: ScanMetrics = emptyScanMetrics
+        let highWater: Mutex<Double> = Mutex(0)
+        let pool: DatabasePool = pool
+        let publishProgress: @Sendable () throws -> Void = {
+            if let value: IndexProgress = try pool.read({ db in try cacheProgress(db, root: root, elapsed: elapsedSeconds(start)) }) {
+                let fraction: Double = highWater.withLock { previous in
+                    previous = max(previous, value.completionFraction)
+                    return previous
+                }
+                receiveEvent(.progress(IndexProgress(entriesObserved: value.entriesObserved, logicalBytesObserved: value.logicalBytesObserved,
+                    allocatedBytesObserved: value.allocatedBytesObserved, elapsedSeconds: value.elapsedSeconds,
+                    previousNodeCount: value.previousNodeCount, completionFraction: fraction)))
+            }
+        }
+        try publishProgress()
+        var settled: Bool = false
+        for _: Int in 0..<8 {
+            while let path: Data = try await pool.read({ db in
+                try pendingCacheDirectory(db, root: rootPath)
+            }) {
+                if isCancelled() { throw ScanError.cancelled }
+                let report: ScanSummary = try await enumerate(path: path, options: options, receiveEvent: receiveEvent, publishProgress: publishProgress, isCancelled: isCancelled)
+                metrics = addMetrics(metrics, report.metrics)
+                try publishProgress()
+            }
+            if isCancelled() { throw ScanError.cancelled }
+            let pending: JournalReplay = try journal.drain()
+            let invalidated: Bool = try await pool.write { db in
+                _ = try beginCacheChanges(db)
+                try applyCacheReplay(db, replay: pending)
+                let resolved: Data = try resolveCacheAlias(db, path: rootPath)
+                let scopes: [Data] = try cacheProjection(db, path: resolved, viewRoot: resolved)?.scopes ?? [resolved]
+                for scope: Data in scopes {
+                    let (lower, upper): (Data, Data) = cacheRange(scope)
+                    let changed: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM directories WHERE done=1 AND report IS NOT NULL AND (path=? OR (path>=? AND path<?)) AND EXISTS(SELECT 1 FROM json_each(CAST(report AS TEXT),'$.issues') WHERE json_extract(value,'$.kind')='changedDuringScan')", arguments: [scope, lower, upper])
+                    for directory: Data in changed { try invalidateCacheListing(db, path: directory) }
+                }
+                try rebuildCacheTotals(db)
+                return try pendingCacheDirectory(db, root: rootPath) != nil
+            }
+            if !invalidated { settled = true; break }
+        }
+        guard settled else { throw IndexError.unstableFilesystem(root) }
+        if isCancelled() { throw ScanError.cancelled }
+        let completedMetrics: ScanMetrics = metrics
+        let result: IndexSummary = try await pool.write { db in
+            let completedRevision: Int64 = try beginCacheChanges(db)
+            let resolved: Data = try resolveCacheAlias(db, path: rootPath)
+            try db.execute(sql: "UPDATE nodes SET scan_revision=?,scan_date=?,scan_metrics=? WHERE path=?", arguments: [completedRevision, Date().timeIntervalSince1970, try JSONEncoder().encode(completedMetrics), resolved])
+            try markCacheAncestors(db, path: resolved)
+            try rebuildCacheTotals(db)
+            guard let summary: IndexSummary = try cacheSummary(db, root: root) else { throw IndexError.malformedCache("Selected folder missing after scan: \(root)") }
+            return summary
+        }
+        receiveEvent(.progress(IndexProgress(entriesObserved: result.nodeCount, logicalBytesObserved: result.logicalBytes, allocatedBytesObserved: result.allocatedBytes, elapsedSeconds: elapsedSeconds(start), previousNodeCount: result.nodeCount, completionFraction: 1)))
+        receiveEvent(.completed(result))
+        return result
+    }
+
+    private func enumerate(path: Data, options: ScanOptions, receiveEvent: @escaping @Sendable (IndexEvent) -> Void, publishProgress: @escaping @Sendable () throws -> Void, isCancelled: @escaping @Sendable () -> Bool) async throws -> ScanSummary {
+        let epoch: Int64 = try await pool.write { db in
+            try db.execute(sql: "UPDATE cache_state SET epoch=epoch+1 WHERE id=1")
+            return try Int64.fetchOne(db, sql: "SELECT epoch FROM cache_state WHERE id=1")!
+        }
+        let opened: FileMetadata
+        do { opened = try DirectoryScanner.directoryMetadata(path: path) }
+        catch ScanError.systemCall(let failed, let operation, let code) {
+            let kind: ScanIssueKind
+            if code == EACCES || code == EPERM {
+                kind = .permissionDenied
+            } else if code == ENOENT || code == ENOTDIR {
+                kind = .vanished
+            } else {
+                kind = .ioError
+            }
+            let report: ScanSummary = ScanSummary(metrics: emptyScanMetrics, issues: [ScanIssue(kind: kind, path: failed, operation: operation, errnoCode: code)], aliases: [])
+            try await pool.write { db in
+                let revision: Int64 = try beginCacheChanges(db)
+                if code == ENOENT || code == ENOTDIR {
+                    try removeCacheTree(db, path: path, revision: revision)
+                    if let parent: Data = cacheParent(path) { try invalidateCacheListing(db, path: parent) }
+                } else {
+                    try db.execute(sql: "UPDATE directories SET done=1,observed=1,report=? WHERE path=?", arguments: [try JSONEncoder().encode(report), path])
+                    try db.execute(sql: "UPDATE nodes SET scan_revision=(SELECT revision FROM cache_state WHERE id=1) WHERE path=?", arguments: [path])
+                    try markCacheAncestors(db, path: path)
+                }
+                try rebuildCacheTotals(db)
+            }
+            return report
+        }
+        let alias: Data? = try await pool.read { db in
+            if let existing: Data = try Data.fetchOne(db, sql: "SELECT target FROM aliases WHERE path=?", arguments: [path]),
+               let target: IndexedNode = try cacheNode(db, path: try resolveCacheAlias(db, path: existing)),
+               target.entry.metadata.device == opened.device, target.entry.metadata.inode == opened.inode,
+               target.entry.metadata.birthTime == opened.birthTime { return existing }
+            let ownsObservations: Bool = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM nodes n JOIN directories d ON d.path=n.path WHERE n.path=? AND (n.total_count>1 OR d.observed=1) AND NOT EXISTS(SELECT 1 FROM aliases a WHERE a.path=n.path))", arguments: [path])!
+            if ownsObservations { return nil }
+            let candidates: [Row] = try Row.fetchAll(db, sql: "SELECT n.path,n.metadata FROM nodes n JOIN directories d ON d.path=n.path WHERE (d.observed=1 OR n.total_count>1) AND n.path<>? AND n.directory=1 AND NOT EXISTS(SELECT 1 FROM aliases a WHERE a.path=n.path) AND substr(n.metadata,9,16)=? ORDER BY length(n.path),n.path", arguments: [path, encodeMetadata(opened).subdata(in: 8..<24)])
+            for row: Row in candidates {
+                let metadata: FileMetadata = try decodeMetadata(row["metadata"])
+                if metadata.birthTime == opened.birthTime, !cacheContains(row["path"], in: path) { return row["path"] }
+            }
+            return nil
+        }
+        if let alias {
+            let report: ScanSummary = ScanSummary(metrics: emptyScanMetrics, issues: [ScanIssue(kind: .directoryAlias, path: path, operation: "descend", errnoCode: 0)], aliases: [ScanAlias(aliasPath: path, targetPath: alias)])
+            try await pool.write { db in
+                let revision: Int64 = try beginCacheChanges(db)
+                let children: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM nodes WHERE parent=?", arguments: [path])
+                for child: Data in children { try removeCacheTree(db, path: child, revision: revision) }
+                try db.execute(sql: "INSERT INTO aliases(path,target,seen) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET target=excluded.target,seen=excluded.seen", arguments: [path, alias, epoch])
+                try db.execute(sql: "UPDATE directories SET done=1,observed=1,report=? WHERE path=?", arguments: [try JSONEncoder().encode(report), path])
+                try db.execute(sql: "UPDATE nodes SET scan_revision=(SELECT revision FROM cache_state WHERE id=1) WHERE path=?", arguments: [path])
+                try markCacheAncestors(db, path: path)
+                try rebuildCacheTotals(db)
+            }
+            return report
+        }
+        let pool: DatabasePool = pool
+        let report: ScanSummary = try await Task.detached(priority: .utility) {
+            try DirectoryScanner.enumerateDirectory(path: path, options: options, isCancelled: isCancelled, receiveProgress: { _ in }) { batch in
+                try pool.write { db in
+                    let observedRevision: Int64 = try beginCacheChanges(db)
+                    try recordCacheEntries(db, entries: batch, directory: path, epoch: epoch, revision: observedRevision)
+                    try rebuildCacheTotals(db)
+                }
+                receiveEvent(.batch(batch))
+                try publishProgress()
+            }
+        }.value
+        try await pool.write { db in
+            let revision: Int64 = try beginCacheChanges(db)
+            let failed: Bool = report.issues.contains { ![.excluded, .mountBoundary, .directoryAlias].contains($0.kind) }
+            if !failed {
+                let obsolete: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM nodes INDEXED BY node_children WHERE parent=? AND seen<>?", arguments: [path, epoch])
+                for child: Data in obsolete { try removeCacheTree(db, path: child, revision: revision) }
+            }
+            try db.execute(sql: "DELETE FROM aliases WHERE path=?", arguments: [path])
+            try db.execute(sql: "UPDATE directories SET done=1,observed=1,report=? WHERE path=?", arguments: [try JSONEncoder().encode(report), path])
+            try db.execute(sql: "UPDATE nodes SET scan_revision=(SELECT revision FROM cache_state WHERE id=1) WHERE path=?", arguments: [path])
+            try markCacheAncestors(db, path: path)
+            try rebuildCacheTotals(db)
+        }
+        return report
     }
 }
 
-private func normalizedRoot(_ root: String) -> String {
-    URL(fileURLWithPath: root).standardizedFileURL.path
-}
+private func normalizedRoot(_ root: String) -> String { URL(fileURLWithPath: root).standardizedFileURL.path }
 
 private func physicalDirectoryPath(_ path: String) throws -> String {
     let descriptor: Int32 = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard descriptor >= 0 else { throw ScanError.systemCall(path: Data(path.utf8), operation: "open cache directory", errnoCode: errno) }
-    defer { close(descriptor) }
+    defer { _ = close(descriptor) }
     var bytes: [CChar] = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-    let code: Int32 = bytes.withUnsafeMutableBufferPointer { fcntl(descriptor, F_GETPATH_NOFIRMLINK, $0.baseAddress!) }
-    guard code == 0 else { throw ScanError.systemCall(path: Data(path.utf8), operation: "F_GETPATH_NOFIRMLINK cache directory", errnoCode: errno) }
-    guard let physical: String = bytes.withUnsafeBufferPointer({ String(validatingCString: $0.baseAddress!) }) else { throw IndexError.invalidQuery("Cache directory path is not UTF-8") }
-    return physical
-}
-
-private func loadSummary(db: Database, root: String) throws -> IndexSummary? {
-    guard let data: Data = try Data.fetchOne(db, sql: "SELECT summary FROM roots WHERE root=?", arguments: [root]) else { return nil }
-    return try JSONDecoder().decode(IndexSummary.self, from: data)
-}
-
-private func decodeNode(_ row: Row) throws -> IndexedNode {
-    try indexedNode(RowData(path: row["path"], parent: row["parent"], name: row["name"], metadata: row["metadata"], logical: row["total_logical"], allocated: row["total_allocated"], count: row["total_count"], aliasTarget: row["alias_target"]))
-}
-
-private func pathDepth(_ path: Data) -> Int { path.reduce(0) { $0 + ($1 == 47 ? 1 : 0) } }
-
-private func parentPath(_ path: Data) -> Data {
-    guard let slash: Data.Index = path.lastIndex(of: 47), slash > path.startIndex else { return Data("/".utf8) }
-    return Data(path[..<slash])
-}
-
-private func prefixRange(_ path: Data) -> (Data, Data) {
-    var prefix: Data = path
-    if prefix.last != 47 { prefix.append(47) }
-    var upper: Data = prefix
-    upper[upper.count - 1] = 48
-    return (prefix, upper)
-}
-
-private func isDescendant(_ path: Data, of ancestor: Data) -> Bool {
-    let prefix: Data = prefixRange(ancestor).0
-    return path.starts(with: prefix)
-}
-
-private func excludedPath(_ path: Data, directory: Data) -> Bool {
-    path == directory || isDescendant(path, of: directory)
-}
-
-private func minimalPaths(_ paths: [Data]) -> [Data] {
-    var result: [Data] = []
-    for path: Data in paths.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
-        if !result.contains(where: { path == $0 || isDescendant(path, of: $0) }) { result.append(path) }
-    }
+    guard fcntl(descriptor, F_GETPATH_NOFIRMLINK, &bytes) == 0 else { throw ScanError.systemCall(path: Data(path.utf8), operation: "F_GETPATH_NOFIRMLINK cache directory", errnoCode: errno) }
+    let result: String? = bytes.withUnsafeBufferPointer { String(validatingCString: $0.baseAddress!) }
+    guard let result else { throw ScanError.invalidPath(Data(path.utf8)) }
     return result
 }
 
-private func removeTree(db: Database, root: String, path: Data, revision: Int64) throws {
-    let (lower, upper): (Data, Data) = prefixRange(path)
-    try db.execute(sql: "UPDATE nodes SET modified_revision=? WHERE root=? AND path=?", arguments: [revision, root, parentPath(path)])
-    try db.execute(sql: "DELETE FROM nodes WHERE root=? AND path=?", arguments: [root, path])
-    try db.execute(sql: "DELETE FROM nodes WHERE root=? AND path>=? AND path<?", arguments: [root, lower, upper])
-    try db.execute(sql: "DELETE FROM aliases WHERE root=? AND (path=? OR (path>=? AND path<?) OR target=? OR (target>=? AND target<?))", arguments: [root, path, lower, upper, path, lower, upper])
-}
-
-private func removeUnseen(db: Database, root: String, path: Data, revision: Int64) throws {
-    let (lower, upper): (Data, Data) = prefixRange(path)
-    try db.execute(sql: "DELETE FROM nodes WHERE root=? AND seen<>? AND path=?", arguments: [root, revision, path])
-    try db.execute(sql: "DELETE FROM nodes WHERE root=? AND seen<>? AND path>=? AND path<?", arguments: [root, revision, lower, upper])
-    try db.execute(sql: "DELETE FROM aliases WHERE root=? AND seen<>? AND (path=? OR (path>=? AND path<?))", arguments: [root, revision, path, lower, upper])
-}
-
-private func preserveUnreachable(db: Database, root: String, issues: [ScanIssue], revision: Int64) throws {
-    for issue: ScanIssue in issues where [.permissionDenied, .metadataUnavailable, .ioError, .changedDuringScan].contains(issue.kind) {
-        let (lower, upper): (Data, Data) = prefixRange(issue.path)
-        try db.execute(sql: "UPDATE nodes SET seen=? WHERE root=? AND path=?", arguments: [revision, root, issue.path])
-        try db.execute(sql: "UPDATE nodes SET seen=? WHERE root=? AND path>=? AND path<?", arguments: [revision, root, lower, upper])
-        try db.execute(sql: "UPDATE aliases SET seen=? WHERE root=? AND (path=? OR (path>=? AND path<?))", arguments: [revision, root, issue.path, lower, upper])
-    }
-}
-
-private func resetSeen(db: Database, root: String, path: Data) throws {
-    let (lower, upper): (Data, Data) = prefixRange(path)
-    try db.execute(sql: "UPDATE nodes SET seen=0 WHERE root=? AND path=?", arguments: [root, path])
-    try db.execute(sql: "UPDATE nodes SET seen=0 WHERE root=? AND path>=? AND path<?", arguments: [root, lower, upper])
-    try db.execute(sql: "UPDATE aliases SET seen=0 WHERE root=? AND (path=? OR (path>=? AND path<?))", arguments: [root, path, lower, upper])
-}
-
-private func resolveAliasPath(db: Database, root: String, path: Data) throws -> Data {
-    var current: Data = path
-    var visited: Set<Data> = []
-    while visited.insert(current).inserted {
-        var ancestor: Data = current
-        var replacement: Data?
-        while ancestor == Data(root.utf8) || isDescendant(ancestor, of: Data(root.utf8)) {
-            if let target: Data = try Data.fetchOne(db, sql: "SELECT target FROM aliases WHERE root=? AND path=?", arguments: [root, ancestor]) {
-                replacement = target + current.dropFirst(ancestor.count)
-                break
-            }
-            if ancestor == Data(root.utf8) { break }
-            ancestor = parentPath(ancestor)
+private func applyCacheReplay(_ db: Database, replay: JournalReplay) throws {
+    if replay.requiresFullScan {
+        let paths: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM directories WHERE done=1")
+        for path: Data in paths { try invalidateCacheListing(db, path: path) }
+    } else {
+        for path: String in replay.recursiveDirectories {
+            let physical: Data = Data(path.utf8)
+            let (lower, upper): (Data, Data) = cacheRange(physical)
+            var paths: Set<Data> = try journalCachePaths(db, physical: physical)
+            paths.formUnion(try Data.fetchAll(db, sql: "SELECT path FROM physical_paths WHERE physical>=? AND physical<?", arguments: [lower, upper]))
+            for mapped: Data in paths { try invalidateCacheSubtree(db, path: mapped) }
         }
-        guard let replacement else { return current }
-        current = replacement
+        for path: String in replay.dirtyDirectories {
+            for mapped: Data in try journalCachePaths(db, physical: Data(path.utf8)) { try invalidateCacheListing(db, path: mapped) }
+        }
     }
-    throw IndexError.malformedCache("Filesystem alias cycle")
-}
-
-private func markRemovedParents(db: Database, root: String, path: Data, revision: Int64) throws {
-    let (lower, upper): (Data, Data) = prefixRange(path)
-    try db.execute(sql: "UPDATE nodes SET modified_revision=? WHERE root=? AND path IN (SELECT parent FROM nodes WHERE root=? AND seen<>? AND path=? UNION SELECT parent FROM nodes WHERE root=? AND seen<>? AND path>=? AND path<?)", arguments: [revision, root, root, revision, path, root, revision, lower, upper])
-}
-
-private func markAncestors(db: Database, path: Data, rootPath: Data) throws {
-    var current: Data = path
-    while current == rootPath || isDescendant(current, of: rootPath) {
-        try db.execute(sql: "INSERT OR IGNORE INTO dirty(path,depth) VALUES(?,?)", arguments: [current, pathDepth(current)])
-        if current == rootPath { break }
-        current = parentPath(current)
-    }
-}
-
-private func rebuildAggregates(db: Database, root: String) throws {
-    let cursor: RowCursor = try Row.fetchCursor(db, sql: "SELECT path FROM dirty ORDER BY depth DESC")
-    let update: Statement = try db.makeStatement(sql: """
-        UPDATE nodes SET
-            total_logical=logical+COALESCE((SELECT SUM(total_logical) FROM nodes c INDEXED BY node_children WHERE c.root=? AND c.parent=nodes.path),0),
-            total_allocated=allocated+COALESCE((SELECT SUM(total_allocated) FROM nodes c INDEXED BY node_children WHERE c.root=? AND c.parent=nodes.path),0),
-            total_count=1+COALESCE((SELECT SUM(total_count) FROM nodes c INDEXED BY node_children WHERE c.root=? AND c.parent=nodes.path),0),
-            total_revision=MAX(modified_revision,COALESCE((SELECT MAX(total_revision) FROM nodes c INDEXED BY node_children WHERE c.root=? AND c.parent=nodes.path),0))
-        WHERE root=? AND path=? AND directory=1
-        """)
-    while let row: Row = try cursor.next() {
-        let path: Data = row["path"]
-        try update.execute(arguments: [root, root, root, root, root, path])
-    }
+    try db.execute(sql: "UPDATE cache_state SET checkpoint=? WHERE id=1", arguments: [try replay.checkpoint.map { try JSONEncoder().encode($0) }])
 }
 
 private func addMetrics(_ left: ScanMetrics, _ right: ScanMetrics) -> ScanMetrics {
@@ -621,6 +430,35 @@ private func addMetrics(_ left: ScanMetrics, _ right: ScanMetrics) -> ScanMetric
 }
 
 private func elapsedSeconds(_ start: ContinuousClock.Instant) -> Double {
-    let components: (seconds: Int64, attoseconds: Int64) = start.duration(to: .now).components
-    return Double(components.seconds) + Double(components.attoseconds) / 1e18
+    let value: Duration = start.duration(to: .now)
+    return Double(value.components.seconds) + Double(value.components.attoseconds) / 1e18
+}
+
+private func journalCachePaths(_ db: Database, physical: Data) throws -> Set<Data> {
+    var paths: Set<Data> = [physical]
+    var ancestor: Data? = physical
+    while let current: Data = ancestor {
+        let locations: [Data] = try Data.fetchAll(db, sql: "SELECT path FROM physical_paths WHERE physical=?", arguments: [current])
+        for location: Data in locations { paths.insert(location + physical.dropFirst(current.count)) }
+        ancestor = cacheParent(current)
+    }
+    return paths
+}
+
+private func directoryLocations(path: Data) throws -> Set<Data> {
+    let descriptor: Int32 = (path + Data([0])).withUnsafeBytes { open($0.baseAddress!.assumingMemoryBound(to: CChar.self), O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
+    guard descriptor >= 0 else { throw ScanError.systemCall(path: path, operation: "open journal location", errnoCode: errno) }
+    defer { _ = close(descriptor) }
+    var locations: Set<Data> = []
+    for command: Int32 in [F_GETPATH, F_GETPATH_NOFIRMLINK] {
+        var bytes: [UInt8] = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(descriptor, command, &bytes) == 0 else { throw ScanError.systemCall(path: path, operation: "fcntl journal location", errnoCode: errno) }
+        locations.insert(Data(bytes.prefix { $0 != 0 }))
+    }
+    return locations
+}
+
+private func storeDirectoryLocations(_ db: Database, path: Data, locations: Set<Data>) throws {
+    try db.execute(sql: "DELETE FROM physical_paths WHERE path=?", arguments: [path])
+    for location: Data in locations { try db.execute(sql: "INSERT INTO physical_paths(path,physical) VALUES(?,?)", arguments: [path, location]) }
 }

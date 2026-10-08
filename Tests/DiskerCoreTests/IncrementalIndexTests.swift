@@ -99,39 +99,31 @@ private func waitForIncrementalSignal(_ semaphore: DispatchSemaphore, timeout: D
 @Suite("Incremental index", .serialized)
 struct IncrementalIndexTests {
     @Test(arguments: [ScanIssueKind.vanished, .metadataUnavailable, .ioError, .changedDuringScan])
-    func resumedScanRetriesFailedDirectoryReportsWithoutRepeatingSuccessfulBranches(kind: ScanIssueKind) throws {
+    func resumedScanRetriesFailedDirectoryReportsWithoutRepeatingSuccessfulBranches(kind: ScanIssueKind) async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
         let branch: URL = fixture.root.appendingPathComponent("a")
         try createIncrementalFiles(directory: branch, count: 1, bytes: 3)
-        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
-        let database: URL = fixture.container.appendingPathComponent("pending.sqlite")
-        let pending: PendingScan = try PendingScan(databaseURL: database, root: fixture.root.path)
-        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
-        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
-        let replay: JournalReplay = JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false)
-        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
-        _ = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
-            receiveEvent: { _ in }, isCancelled: { false })
-        let report: ScanSummary = ScanSummary(metrics: ScanMetrics(entries: 0, directories: 0, bulkCalls: 0, metadataCalls: 0, contentBytesRead: 0),
+        try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 600, bytes: 5)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        let report: ScanSummary = ScanSummary(metrics: emptyScanMetrics,
             issues: [ScanIssue(kind: kind, path: Data(branch.path.utf8), operation: "fixture", errnoCode: EIO)], aliases: [])
-        let writer: DatabaseQueue = try DatabaseQueue(path: database.path)
-        try writer.write { db in
-            try db.execute(sql: "UPDATE jobs SET report=? WHERE root=? AND path=?", arguments: [try JSONEncoder().encode(report), fixture.root.path, Data(branch.path.utf8)])
+        let writer: DatabaseQueue = try DatabaseQueue(path: fixture.database.path)
+        try await writer.write { db in
+            try db.execute(sql: "UPDATE directories SET report=? WHERE path=?", arguments: [try JSONEncoder().encode(report), Data(branch.path.utf8)])
         }
         try Data(repeating: 2, count: 17).write(to: branch.appendingPathComponent("file-0"))
-        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
-        let summary: ScanSummary = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
-            receiveEvent: { _ in }, isCancelled: { false })
-        var entries: [ScanEntry] = []
-        try pending.replay(isCancelled: { false }) { entries += $0 }
+        let summary: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { _ in }, isCancelled: { false })
         #expect(summary.issues.isEmpty)
-        #expect(summary.metrics.entries == 2)
-        #expect(entries.count == 5)
-        #expect(entries.filter { $0.metadata.kind != .directory }.reduce(UInt64(0)) { $0 + $1.metadata.logicalBytes } == 22)
+        #expect(summary.metrics.entries < 10)
+        #expect(summary.nodeCount == 604)
+        #expect(summary.logicalBytes == 3017)
     }
 
-    @Test func resumedScanRetriesPermissionGapsAfterAccessIsRestoredWithoutJournalEvents() throws {
+    @Test(.enabled(if: geteuid() != 0))
+    func resumedScanRetriesPermissionGapsAfterAccessIsRestoredWithoutJournalEvents() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         let branch: URL = fixture.root.appendingPathComponent("a")
         defer {
@@ -142,98 +134,72 @@ struct IncrementalIndexTests {
         try createIncrementalFiles(directory: branch, count: 1, bytes: 3)
         try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: branch.path)
-        let pending: PendingScan = try PendingScan(databaseURL: fixture.container.appendingPathComponent("pending.sqlite"), root: fixture.root.path)
-        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
-        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
-        let replay: JournalReplay = JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false)
-        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
         let cancelled: Mutex<Bool> = Mutex(false)
-        #expect(throws: ScanError.cancelled) {
-            try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
-                receiveEvent: { event in
-                    if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
-                }, isCancelled: { cancelled.withLock { $0 } })
+        await #expect(throws: ScanError.cancelled) {
+            try await index.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { event in
+                if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
+            }, isCancelled: { cancelled.withLock { $0 } })
         }
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: branch.path)
-        try pending.prepare(revision: 1, metadata: metadata, options: options, replay: replay)
-        let summary: ScanSummary = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
-            receiveEvent: { _ in }, isCancelled: { false })
-        var entries: [ScanEntry] = []
-        try pending.replay(isCancelled: { false }) { entries += $0 }
+        let reopened: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let summary: IndexSummary = try await reopened.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { _ in }, isCancelled: { false })
         #expect(summary.issues.isEmpty)
-        #expect(entries.count == 5)
-        #expect(entries.contains { $0.path == Data(branch.appendingPathComponent("file-0").path.utf8) })
-        #expect(entries.filter { $0.metadata.kind != .directory }.reduce(UInt64(0)) { $0 + $1.metadata.logicalBytes } == 8)
-        // Restored preview batches precede new enumeration; metrics count only new work.
-        #expect(summary.metrics.entries == 4)
+        #expect(summary.nodeCount == 5)
+        #expect(summary.logicalBytes == 8)
+        #expect(try await reopened.node(root: branch.path, path: Data(branch.appendingPathComponent("file-0").path.utf8)) != nil)
     }
 
     @Test(arguments: RetryMutation.allCases)
-    fileprivate func resumedDirtyDirectoryRemovedOrReplacedDropsItsOldDescendants(mutation: RetryMutation) throws {
+    fileprivate func resumedDirtyDirectoryRemovedOrReplacedDropsItsOldDescendants(mutation: RetryMutation) async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
         let branch: URL = fixture.root.appendingPathComponent("a")
         try createIncrementalFiles(directory: branch, count: 1, bytes: 3)
         try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
-        let pending: PendingScan = try PendingScan(databaseURL: fixture.container.appendingPathComponent("pending.sqlite"), root: fixture.root.path)
-        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
-        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
-        try pending.prepare(revision: 1, metadata: metadata, options: options,
-            replay: JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false))
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
         let cancelled: Mutex<Bool> = Mutex(false)
-        #expect(throws: ScanError.cancelled) {
-            try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
-                receiveEvent: { event in
-                    if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
-                }, isCancelled: { cancelled.withLock { $0 } })
+        await #expect(throws: ScanError.cancelled) {
+            try await index.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { event in
+                if case .progress(let progress) = event, progress.completionFraction > 0.4 { cancelled.withLock { $0 = true } }
+            }, isCancelled: { cancelled.withLock { $0 } })
         }
         try FileManager.default.removeItem(at: branch)
         if mutation == .replaceWithFile { try Data(repeating: 2, count: 11).write(to: branch) }
-        try pending.prepare(revision: 1, metadata: metadata, options: options,
-            replay: JournalReplay(checkpoint: nil, dirtyDirectories: [branch.path], recursiveDirectories: [], requiresFullScan: false))
-        _ = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
-            receiveEvent: { _ in }, isCancelled: { false })
-        var entries: [ScanEntry] = []
-        try pending.replay(isCancelled: { false }) { entries += $0 }
-        #expect(!entries.contains { $0.path == Data(branch.appendingPathComponent("file-0").path.utf8) })
-        #expect(entries.count == (mutation == .remove ? 3 : 4))
-        #expect(entries.filter { $0.metadata.kind != .directory }.reduce(UInt64(0)) { $0 + $1.metadata.logicalBytes } == (mutation == .remove ? 5 : 16))
+        let summary: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .directories([Data(fixture.root.path.utf8)]), receiveEvent: { _ in }, isCancelled: { false })
+        #expect(try await index.node(root: fixture.root.path, path: Data(branch.appendingPathComponent("file-0").path.utf8)) == nil)
+        #expect(summary.nodeCount == (mutation == .remove ? 3 : 4))
+        #expect(summary.logicalBytes == (mutation == .remove ? 5 : 16))
     }
 
-    @Test func completedDirectoriesAreDurableBeforeScanningTheNextDirectory() throws {
+    @Test func completedDirectoriesAreDurableBeforeScanningTheNextDirectory() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
         try createIncrementalFiles(directory: fixture.root.appendingPathComponent("a"), count: 1, bytes: 3)
         try createIncrementalFiles(directory: fixture.root.appendingPathComponent("b"), count: 1, bytes: 5)
-        let database: URL = fixture.container.appendingPathComponent("pending.sqlite")
-        let pending: PendingScan = try PendingScan(databaseURL: database, root: fixture.root.path)
-        let metadata: FileMetadata = try DirectoryScanner.directoryMetadata(path: Data(fixture.root.path.utf8))
-        let options: ScanOptions = ScanOptions(batchSize: 512, bufferSize: 256 * 1024, mountPolicy: .sameDevice, excludedPaths: [])
-        try pending.prepare(revision: 1, metadata: metadata, options: options,
-            replay: JournalReplay(checkpoint: nil, dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: false))
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
         var configuration: Configuration = Configuration()
         configuration.readonly = true
-        let reader: DatabaseQueue = try DatabaseQueue(path: database.path, configuration: configuration)
+        let reader: DatabaseQueue = try DatabaseQueue(path: fixture.database.path, configuration: configuration)
         let checkpoints: Mutex<Int> = Mutex(0)
         let previousFraction: Mutex<Double> = Mutex(0)
-        _ = try pending.run(options: options, metadata: metadata, previousNodeCount: nil, start: .now,
-            receiveEvent: { event in
-                guard case .progress(let progress) = event else { return }
-                let completed: Bool = previousFraction.withLock { previous in
-                    guard progress.completionFraction > previous else { return false }
-                    previous = progress.completionFraction
-                    return true
+        _ = try await index.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { event in
+            guard case .progress(let progress) = event, progress.completionFraction < 1 else { return }
+            let completed: Bool = previousFraction.withLock { previous in
+                guard progress.completionFraction > previous else { return false }
+                previous = progress.completionFraction
+                return true
+            }
+            guard completed else { return }
+            do {
+                let stored: Row = try reader.read { db in
+                    try Row.fetchOne(db, sql: "SELECT total_count,progress FROM nodes WHERE path=?", arguments: [Data(fixture.root.path.utf8)])!
                 }
-                guard completed else { return }
-                do {
-                    let stored: Row = try reader.read { db in
-                        try Row.fetchOne(db, sql: "SELECT count,fraction FROM scans WHERE root=?", arguments: [fixture.root.path])!
-                    }
-                    #expect(stored["count"] as Int64 == progress.entriesObserved)
-                    #expect((stored["fraction"] as Double) * 0.95 == progress.completionFraction)
-                    checkpoints.withLock { $0 += 1 }
-                } catch { Issue.record(error) }
-            }, isCancelled: { false })
+                #expect(stored["total_count"] as Int64 == progress.entriesObserved)
+                #expect((stored["progress"] as Double) * 0.95 == progress.completionFraction)
+                checkpoints.withLock { $0 += 1 }
+            } catch { Issue.record(error) }
+        }, isCancelled: { false })
         #expect(checkpoints.withLock { $0 } >= 3)
     }
 
@@ -305,7 +271,7 @@ struct IncrementalIndexTests {
                 }
             }, isCancelled: { cancelled.withLock { $0 } })
         }
-        #expect(try await index.cachedSummary(root: fixture.root.path) == nil)
+        #expect(try await index.cachedSummary(root: fixture.root.path)?.isComplete == false)
         let reopened: DiskIndex = try DiskIndex(databaseURL: fixture.database)
         let firstProgress: Mutex<IndexProgress?> = Mutex(nil)
         let summary: IndexSummary = try await reopened.refresh(root: fixture.root.path, mode: .automatic, receiveEvent: { event in
@@ -443,9 +409,10 @@ struct IncrementalIndexTests {
         #expect(queryCompleted == .success)
         release.signal()
         let (children, summary): ([IndexedNode], IndexSummary?) = try await query.value
-        #expect(children.count == 1)
-        #expect(summary?.revision == previous.revision)
+        #expect(children.count == 2)
+        #expect(summary!.revision > previous.revision)
         #expect(summary?.logicalBytes == 3)
+        #expect(summary?.isComplete == false)
         let updated: IndexSummary = try await refresh.value
         #expect(updated.logicalBytes == 1_203)
     }
@@ -528,9 +495,10 @@ struct IncrementalIndexTests {
         #expect(queryCompleted == .success)
         release.signal()
         let (children, summary): ([IndexedNode], IndexSummary?) = try await query.value
-        #expect(children.count == 1)
-        #expect(summary?.revision == previous.revision)
+        #expect(children.count == 2)
+        #expect(summary!.revision > previous.revision)
         #expect(summary?.logicalBytes == 3)
+        #expect(summary?.isComplete == false)
         let updated: IndexSummary = try await refresh.value
         #expect(updated.logicalBytes == 1_203)
     }
@@ -610,6 +578,52 @@ struct IncrementalIndexTests {
         #expect(try await index.node(root: fixture.root.path, path: removed) == nil)
     }
 
+    @Test func sortedPageReorderingChangesTheRevisionUsedByModelReloads() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        try createIncrementalFiles(directory: fixture.root, count: 1000, bytes: 4096)
+        let moved: URL = fixture.root.appendingPathComponent("last")
+        try Data().write(to: moved)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let before: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let first: [IndexedNode] = try await index.children(root: fixture.root.path, directory: Data(fixture.root.path.utf8), offset: 0, limit: 500)
+        try Data(repeating: 2, count: 8192).write(to: moved)
+        _ = try await index.refresh(root: fixture.root.path, mode: .directories([Data(fixture.root.path.utf8)]), receiveEvent: { _ in }, isCancelled: { false })
+        let second: [IndexedNode] = try await index.children(root: fixture.root.path, directory: Data(fixture.root.path.utf8), offset: 500, limit: 500)
+        #expect(!Set(first.map(\.entry.path)).isDisjoint(with: second.map(\.entry.path)))
+        #expect(try await index.cachedSummary(root: fixture.root.path)!.revision > before.revision, "The model must reject pages from opposite sides of a live reorder")
+    }
+
+    @Test func finalDirectoryPruningAdvancesTheRevisionAfterItsLastBatch() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        try createIncrementalFiles(directory: fixture.root, count: 1000, bytes: 1)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("file-0"))
+        let entered: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let streamed: Mutex<Int> = Mutex(0)
+        defer { release.signal() }
+        let refresh: Task<IndexSummary, any Error> = Task.detached {
+            try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in
+                guard case .batch(let entries) = event else { return }
+                let final: Bool = streamed.withLock { count in count += entries.count; return count == 1000 }
+                if final {
+                    entered.signal()
+                    if release.wait(timeout: .now() + 5) == .timedOut { Issue.record("Timed out releasing final directory batch") }
+                }
+            }, isCancelled: { false })
+        }
+        try #require(await waitForIncrementalSignal(entered, timeout: .now() + 2) == .success)
+        let before: IndexSummary = try #require(try await index.cachedSummary(root: fixture.root.path))
+        #expect(before.nodeCount == 1001)
+        release.signal()
+        let after: IndexSummary = try await refresh.value
+        #expect(after.nodeCount == 1000)
+        #expect(after.revision > before.revision)
+    }
+
     @Test func batchesAndProgressArriveBeforeCompletion() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
@@ -636,7 +650,7 @@ struct IncrementalIndexTests {
         #expect(observed.dropLast().contains("batch"))
     }
 
-    @Test func cancellationAfterStreamingBatchKeepsPersistedTreeAndCheckpointUnchanged() async throws {
+    @Test func cancellationAfterStreamingBatchRetainsNewObservationsAndPendingCoverage() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
         let file: URL = fixture.root.appendingPathComponent("original")
@@ -645,7 +659,7 @@ struct IncrementalIndexTests {
         let previous: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
         let connection: DatabaseQueue = try DatabaseQueue(path: fixture.database.path)
         let previousCheckpoint: Data = try #require(await connection.read { db in
-            try Data.fetchOne(db, sql: "SELECT checkpoint FROM roots WHERE root=?", arguments: [fixture.root.path])
+            try Data.fetchOne(db, sql: "SELECT checkpoint FROM cache_state WHERE id=1")
         })
         try Data(repeating: 2, count: 25).write(to: file)
         let added: URL = fixture.root.appendingPathComponent("new")
@@ -661,13 +675,18 @@ struct IncrementalIndexTests {
         }
         #expect(streamed.withLock { $0 } > 0)
         let reopened: DiskIndex = try DiskIndex(databaseURL: fixture.database)
-        #expect(try await reopened.cachedSummary(root: fixture.root.path) == previous)
-        #expect(try await reopened.node(root: fixture.root.path, path: Data(file.path.utf8))?.entry.metadata.logicalBytes == 5)
-        #expect(try await reopened.node(root: fixture.root.path, path: Data(added.path.utf8)) == nil)
+        let observed: IndexSummary = try #require(try await reopened.cachedSummary(root: fixture.root.path))
+        #expect(observed.revision > previous.revision)
+        #expect(!observed.isComplete)
+        #expect(try await reopened.node(root: fixture.root.path, path: Data(file.path.utf8))?.entry.metadata.logicalBytes == 25)
+        #expect(try await reopened.node(root: fixture.root.path, path: Data(added.path.utf8)) != nil)
         let currentCheckpoint: Data? = try await connection.read { db in
-            try Data.fetchOne(db, sql: "SELECT checkpoint FROM roots WHERE root=?", arguments: [fixture.root.path])
+            try Data.fetchOne(db, sql: "SELECT checkpoint FROM cache_state WHERE id=1")
         }
-        #expect(currentCheckpoint == previousCheckpoint)
+                let previousCursor: JournalCheckpoint = try JSONDecoder().decode(JournalCheckpoint.self, from: previousCheckpoint)
+        let currentCursor: JournalCheckpoint = try JSONDecoder().decode(JournalCheckpoint.self, from: #require(currentCheckpoint))
+        #expect(currentCursor.journalID == previousCursor.journalID)
+        #expect(currentCursor.eventID >= previousCursor.eventID)
     }
 
     @Test(arguments: RetryMutation.allCases)
@@ -679,12 +698,11 @@ struct IncrementalIndexTests {
         try createIncrementalFiles(directory: branch, count: 2, bytes: 8)
         let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
         _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
-        let quiet: IndexSummary = try await unchangedSummary(index: index, root: fixture.root.path)
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
         let issue: ScanIssue = ScanIssue(kind: .changedDuringScan, path: Data(branch.path.utf8), operation: "verifyDirectory", errnoCode: 0)
-        let incomplete: IndexSummary = IndexSummary(root: quiet.root, logicalBytes: quiet.logicalBytes, allocatedBytes: quiet.allocatedBytes, nodeCount: quiet.nodeCount, revision: quiet.revision, lastScanDate: quiet.lastScanDate, isComplete: false, issues: [issue], metrics: quiet.metrics)
         let connection: DatabaseQueue = try DatabaseQueue(path: fixture.database.path)
         try await connection.write { db in
-            try db.execute(sql: "UPDATE roots SET summary=? WHERE root=?", arguments: [try JSONEncoder().encode(incomplete), fixture.root.path])
+            try db.execute(sql: "UPDATE directories SET report=? WHERE path=?", arguments: [try JSONEncoder().encode(ScanSummary(metrics: emptyScanMetrics, issues: [issue], aliases: [])), Data(branch.path.utf8)])
         }
         let checks: Mutex<Int> = Mutex(0)
         let removed: Mutex<Bool> = Mutex(false)
