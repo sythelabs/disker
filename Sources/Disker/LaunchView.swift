@@ -49,8 +49,8 @@ struct LaunchView: View {
             }.value
             completed = try await opened.isComplete()
             mouseImage = try loadOnboardingMouse(bundle: .main)
-            store = opened
             await recheck()
+            store = opened
         } catch { failure = error.localizedDescription }
     }
 
