@@ -525,6 +525,55 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(retained == nil, "The idle watcher keeps the model alive across its next awaited event")
     }
 
+    @Test func stoppingDuringRetargetDoesNotStartTheReplacementRoot() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root, count: 1, bytes: 128)
+        let other: URL = fixture.container.appendingPathComponent("other")
+        try treeFiles(directory: other, count: 1, bytes: 256)
+        let index: DiskIndex = try await cachedTree(fixture: fixture)
+        _ = try await index.refresh(root: other.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let rootPath: Data = Data(fixture.root.path.utf8)
+        let pauseNext: Mutex<Bool> = Mutex(false)
+        let entered: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let targetStarts: Mutex<Int> = Mutex(0)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            if case .started(let cached) = event, cached?.root == other.path { targetStarts.withLock { $0 += 1 } }
+            guard case .batch(let entries) = event, entries.contains(where: { $0.parentPath == rootPath }) else { return }
+            let shouldPause: Bool = pauseNext.withLock { state in
+                if !state { return false }
+                state = false
+                return true
+            }
+            if shouldPause {
+                entered.signal()
+                if release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing scan during stopped retarget") }
+            }
+        })
+        defer { model.stop(); release.signal() }
+        await model.start()
+        try await waitForTreeScan(model)
+        pauseNext.withLock { $0 = true }
+        let oldRefresh: Task<Void, Never> = Task { await model.refreshDirectories([rootPath]) }
+        try #require(await waitForTreeSignal(entered, timeout: .now() + 5) == .success)
+        let retarget: Task<Void, Never> = Task { await model.chooseRoot(other) }
+        let navigationDeadline: Date = Date().addingTimeInterval(5)
+        while !model.canGoBack && Date() < navigationDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        try #require(model.canGoBack)
+        try #require(model.rootPath == fixture.root.path)
+        model.stop()
+        release.signal()
+        await retarget.value
+        await oldRefresh.value
+        #expect(model.rootPath == fixture.root.path, "A stopped navigation resumed and replaced the visible root")
+        #expect(!model.isScanning, "A stopped navigation restarted scanning after the window disappeared")
+        try await waitForTreeScan(model)
+        try Data(repeating: 2, count: 512).write(to: other.appendingPathComponent("file-0"))
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(targetStarts.withLock { $0 } == 0, "The replacement root attached a scan or watcher after stop")
+    }
+
     @Test func nestedFoldersAndFilesCollapseAndReexpandWithParentProportions() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }

@@ -669,6 +669,59 @@ struct IncrementalIndexTests {
         #expect(final.isComplete)
     }
 
+    @Test func repeatedHotDirectoryChangesAllowLaterWorkAndReachTheInstabilityLimit() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let hot: URL = fixture.root.appendingPathComponent("a-hot")
+        let later: URL = fixture.root.appendingPathComponent("zzzzzzzzzz-later")
+        try createIncrementalFiles(directory: hot, count: 1, bytes: 16)
+        try createIncrementalFiles(directory: later, count: 1, bytes: 32)
+        let hotPath: Data = Data(hot.path.utf8)
+        let laterPath: Data = Data(later.path.utf8)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        let attempts: Mutex<Int> = Mutex(0)
+        let laterEnumerated: Mutex<Bool> = Mutex(false)
+        let safetyCancellation: Mutex<Bool> = Mutex(false)
+        var reportedInstability: Bool = false
+        var reportedCancellation: Bool = false
+        do {
+            _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in
+                guard case .batch(let batch) = event else { return }
+                if batch.contains(where: { $0.parentPath == laterPath }) { laterEnumerated.withLock { $0 = true } }
+                guard batch.contains(where: { $0.parentPath == hotPath }) else { return }
+                let attempt: Int = attempts.withLock { count in
+                    count += 1
+                    return count
+                }
+                guard attempt <= 128 else {
+                    safetyCancellation.withLock { $0 = true }
+                    return
+                }
+                do {
+                    try mutateAfterJournalFence(root: fixture.root, requiredDirectories: [hot.path]) {
+                        try Data(repeating: UInt8(attempt % 251), count: 16).write(to: hot.appendingPathComponent("file-0"))
+                    }
+                    // The index stream delivers independently of the mutation fence's stream.
+                    Thread.sleep(forTimeInterval: 0.1)
+                } catch {
+                    Issue.record(error)
+                    safetyCancellation.withLock { $0 = true }
+                }
+            }, isCancelled: { safetyCancellation.withLock { $0 } })
+        } catch IndexError.unstableFilesystem(let path) {
+            #expect(path == fixture.root.path)
+            reportedInstability = true
+        } catch ScanError.cancelled {
+            reportedCancellation = true
+        }
+        #expect(laterEnumerated.withLock { $0 }, "A repeatedly invalidated shallow directory starves later scan work")
+        #expect(reportedInstability, "Live replays bypassed the scan's bounded convergence limit")
+        #expect(!reportedCancellation, "The scan required safety cancellation instead of reporting an unstable filesystem")
+        #expect(!safetyCancellation.withLock { $0 })
+    }
+
     @Test func deletionAfterFirstStreamingBatchDoesNotLeaveAStaleRow() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
