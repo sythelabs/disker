@@ -245,6 +245,7 @@ final class DiskTreeModel {
 
     private func loadRoot(_ path: String) async {
         let previousWatcher: Task<Void, Never>? = stopWatching()
+        var watching: UInt64 = watcherGeneration
         cancelScan()
         generation += 1
         let navigation: UInt64 = generation
@@ -256,6 +257,7 @@ final class DiskTreeModel {
         isWaitingForWriter = false
         scanTask = nil
         scanBuffer = nil
+        guard watching == watcherGeneration, !Task.isCancelled else { return }
         selection = []
         rootPath = path
         expanded = [Data(rootPath.utf8)]
@@ -267,13 +269,12 @@ final class DiskTreeModel {
         scanStopped = false
         guard let index else { await start(); return }
         let ticket: UInt64 = generation
-        var watching: UInt64 = watcherGeneration
         do {
             try await reloadSnapshot(ticket: ticket)
-            guard ticket == generation, watching == watcherGeneration else { return }
+            guard ticket == generation, watching == watcherGeneration, !Task.isCancelled else { return }
             watching += 1
             let attached: UInt64 = try await watchChanges(index: index)
-            if ticket == generation, attached == watcherGeneration { refresh() }
+            if ticket == generation, attached == watcherGeneration, !Task.isCancelled { refresh() }
         } catch {
             if ticket == generation, watching == watcherGeneration, !Task.isCancelled, !(error is CancellationError) { errorMessage = String(describing: error) }
         }
