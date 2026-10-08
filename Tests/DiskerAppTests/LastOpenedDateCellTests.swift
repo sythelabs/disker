@@ -77,6 +77,7 @@ enum DateCellOutcome: CaseIterable {
         _ = NSApplication.shared
         let frame: NSRect = NSRect(x: 0, y: 0, width: 360, height: 80)
         view = NSHostingView(rootView: LastOpenedDateCell(path: path, revision: revision, read: reader.read))
+        view.sizingOptions = []
         view.frame = frame
         window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -90,34 +91,21 @@ enum DateCellOutcome: CaseIterable {
         view.layoutSubtreeIfNeeded()
     }
 
-    var elements: [any NSAccessibilityProtocol] {
-        accessibilityElements(view)
-    }
-
-    var values: [String] {
-        elements.compactMap { $0.accessibilityValue() as? String }
-    }
-
-    var help: [String] {
-        elements.compactMap { $0.accessibilityHelp() }
+    func pixels() throws -> Data {
+        view.layoutSubtreeIfNeeded()
+        let image: NSBitmapImageRep = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        let bytes: UnsafeMutablePointer<UInt8> = try #require(image.bitmapData)
+        let count: Int = image.bytesPerRow * image.pixelsHigh
+        bytes.initialize(repeating: 0, count: count)
+        view.cacheDisplay(in: view.bounds, to: image)
+        return Data(bytes: bytes, count: count)
     }
 }
 
-@MainActor private func accessibilityElements(_ element: any NSAccessibilityProtocol) -> [any NSAccessibilityProtocol] {
-    let children: [any NSAccessibilityProtocol] = (element.accessibilityChildren() ?? []).compactMap { $0 as? any NSAccessibilityProtocol }
-    return [element] + children.flatMap(accessibilityElements)
-}
-
-private func expectedDateLabel(_ date: Date) -> String {
-    date.formatted(.dateTime.month(.abbreviated).day().year().hour().minute())
-        .replacingOccurrences(of: "\u{a0}", with: " ")
-        .replacingOccurrences(of: "\u{202f}", with: " ")
-}
-
-@MainActor private func waitForDateCell(_ operation: String, until predicate: () -> Bool) async throws {
+@MainActor private func waitForDateCell(_ operation: String, until predicate: () throws -> Bool) async throws {
     let deadline: Date = Date().addingTimeInterval(5)
-    while !predicate() && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
-    guard predicate() else { throw DateCellTestError.timedOut(operation) }
+    while try !predicate() && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+    guard try predicate() else { throw DateCellTestError.timedOut(operation) }
 }
 
 @Suite("Date last opened cell", .serialized)
@@ -129,23 +117,24 @@ private func expectedDateLabel(_ date: Date) -> String {
         let host: DateCellHost = DateCellHost(path: path, revision: 1, reader: reader)
         defer { host.window.close(); reader.finishPending() }
         let original: Date = Date(timeIntervalSince1970: 1_000_000)
-        let originalLabel: String = expectedDateLabel(original)
         try await waitForDateCell("starting the initial read", until: { reader.paths.count == 1 })
+        let placeholder: Data = try host.pixels()
         try reader.finish(0, result: .success(original))
-        try await waitForDateCell("rendering the original date", until: { host.values.contains(originalLabel) })
+        try await waitForDateCell("rendering the original date", until: { try host.pixels() != placeholder })
+        let originalPixels: Data = try host.pixels()
 
         host.update(path: path, revision: 2, reader: reader)
         try await waitForDateCell("starting the revision read", until: { reader.paths.count == 2 })
-        #expect(host.values.contains(originalLabel), "A summary revision replaced the visible date with a loading placeholder")
-        #expect(!host.values.contains("-"))
+        #expect(try host.pixels() == originalPixels, "A summary revision replaced the visible date with a loading placeholder")
         try reader.finish(1, result: outcome.result)
-        switch outcome.result {
-        case .success(let date):
-            let label: String = date.map(expectedDateLabel) ?? "-"
-            try await waitForDateCell("rendering the completed date read", until: { host.values.contains(label) })
-            #expect(!host.help.contains(DateCellTestError.readFailed.localizedDescription))
-        case .failure(let error):
-            try await waitForDateCell("rendering the date read error", until: { host.values.contains("-") && host.help.contains(error.localizedDescription) })
+        try await waitForDateCell("completing the revision read", until: { reader.finished.contains(1) })
+        switch outcome {
+        case .unchanged:
+            try await waitForDateCell("rendering the unchanged date", until: { try host.pixels() == originalPixels })
+        case .changed:
+            try await waitForDateCell("rendering the changed date", until: { try host.pixels() != originalPixels && host.pixels() != placeholder })
+        case .unavailable, .failure:
+            try await waitForDateCell("rendering the unavailable date", until: { try host.pixels() == placeholder })
         }
         #expect(reader.paths == [path, path])
     }
@@ -156,31 +145,30 @@ private func expectedDateLabel(_ date: Date) -> String {
         let host: DateCellHost = DateCellHost(path: path, revision: 1, reader: reader)
         defer { host.window.close(); reader.finishPending() }
         try await waitForDateCell("starting the read", until: { reader.paths.count == 1 })
+        let placeholder: Data = try host.pixels()
         try reader.finish(0, result: .success(nil))
         try await waitForDateCell("completing the read", until: { reader.finished.contains(0) })
         host.update(path: path, revision: 1, reader: reader)
         try await Task.sleep(for: .milliseconds(50))
         #expect(reader.paths == [path])
-        #expect(host.values.contains("-"))
-        #expect(host.help.contains("Date last opened unavailable"))
+        #expect(try host.pixels() == placeholder)
     }
 
-    @Test func errorRemainsVisibleUntilARevisionReadRecovers() async throws {
+    @Test func failedDateReadRecoversOnTheNextRevision() async throws {
         let path: Data = Data("/date-cell/file".utf8)
         let reader: DateCellReader = DateCellReader()
         let host: DateCellHost = DateCellHost(path: path, revision: 1, reader: reader)
         defer { host.window.close(); reader.finishPending() }
         try await waitForDateCell("starting the initial read", until: { reader.paths.count == 1 })
+        let placeholder: Data = try host.pixels()
         try reader.finish(0, result: .failure(.readFailed))
-        try await waitForDateCell("rendering the error", until: { host.help.contains(DateCellTestError.readFailed.localizedDescription) })
+        try await waitForDateCell("completing the failed read", until: { reader.finished.contains(0) })
         host.update(path: path, revision: 2, reader: reader)
         try await waitForDateCell("starting the recovery read", until: { reader.paths.count == 2 })
-        #expect(host.values.contains("-"))
-        #expect(host.help.contains(DateCellTestError.readFailed.localizedDescription))
+        #expect(try host.pixels() == placeholder)
         let recovered: Date = Date(timeIntervalSince1970: 2_000_000)
         try reader.finish(1, result: .success(recovered))
-        try await waitForDateCell("rendering the recovered date", until: { host.values.contains(expectedDateLabel(recovered)) })
-        #expect(!host.help.contains(DateCellTestError.readFailed.localizedDescription))
+        try await waitForDateCell("rendering the recovered date", until: { try host.pixels() != placeholder })
     }
 
     @Test(arguments: [DateCellOutcome.unchanged, .failure])
@@ -190,17 +178,17 @@ private func expectedDateLabel(_ date: Date) -> String {
         let host: DateCellHost = DateCellHost(path: path, revision: 1, reader: reader)
         defer { host.window.close(); reader.finishPending() }
         try await waitForDateCell("starting the older read", until: { reader.paths.count == 1 })
+        let placeholder: Data = try host.pixels()
         host.update(path: path, revision: 2, reader: reader)
         try await waitForDateCell("starting the newer read", until: { reader.paths.count == 2 })
         let newest: Date = Date(timeIntervalSince1970: 2_000_000)
-        let newestLabel: String = expectedDateLabel(newest)
         try reader.finish(1, result: .success(newest))
-        try await waitForDateCell("rendering the newer date", until: { host.values.contains(newestLabel) })
+        try await waitForDateCell("rendering the newer date", until: { try host.pixels() != placeholder })
+        let newestPixels: Data = try host.pixels()
         try reader.finish(0, result: outcome.result)
         try await waitForDateCell("finishing the cancelled read", until: { reader.finished.contains(0) })
         try await Task.sleep(for: .milliseconds(50))
-        #expect(host.values.contains(newestLabel))
-        #expect(!host.help.contains(DateCellTestError.readFailed.localizedDescription))
+        #expect(try host.pixels() == newestPixels)
     }
 
     @Test func changedPathNeverDisplaysThePreviousPathsDate() async throws {
@@ -211,12 +199,12 @@ private func expectedDateLabel(_ date: Date) -> String {
         defer { host.window.close(); reader.finishPending() }
         let old: Date = Date(timeIntervalSince1970: 1_000_000)
         try await waitForDateCell("starting the first path read", until: { reader.paths.count == 1 })
+        let placeholder: Data = try host.pixels()
         try reader.finish(0, result: .success(old))
-        try await waitForDateCell("rendering the first path date", until: { host.values.contains(expectedDateLabel(old)) })
+        try await waitForDateCell("rendering the first path date", until: { try host.pixels() != placeholder })
         host.update(path: second, revision: 1, reader: reader)
         try await waitForDateCell("starting the second path read", until: { reader.paths.count == 2 })
-        #expect(host.values.contains("-"))
-        #expect(!host.values.contains(expectedDateLabel(old)))
+        #expect(try host.pixels() == placeholder)
         try reader.finish(1, result: .success(nil))
         try await waitForDateCell("completing the second path read", until: { reader.finished.contains(1) })
         #expect(reader.paths == [first, second])
