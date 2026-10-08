@@ -159,6 +159,7 @@ final class JournalEventBuffer: Sendable {
     let relativePath: String
     let journalID: String?
     private let excludedPaths: [Data]
+    private let receiveChange: @Sendable () -> Void
     private let state: Mutex<JournalBufferState>
     private let historyFinished: DispatchSemaphore
 
@@ -166,11 +167,16 @@ final class JournalEventBuffer: Sendable {
         self.init(rootPath: rootPath, relativePath: relativePath, journalID: journalID, eventID: eventID, requiresFullScan: requiresFullScan, expectsHistory: expectsHistory, excludedPaths: [])
     }
 
-    init(rootPath: String, relativePath: String, journalID: String?, eventID: UInt64, requiresFullScan: Bool, expectsHistory: Bool, excludedPaths: [Data]) {
+    convenience init(rootPath: String, relativePath: String, journalID: String?, eventID: UInt64, requiresFullScan: Bool, expectsHistory: Bool, excludedPaths: [Data]) {
+        self.init(rootPath: rootPath, relativePath: relativePath, journalID: journalID, eventID: eventID, requiresFullScan: requiresFullScan, expectsHistory: expectsHistory, excludedPaths: excludedPaths, receiveChange: {})
+    }
+
+    init(rootPath: String, relativePath: String, journalID: String?, eventID: UInt64, requiresFullScan: Bool, expectsHistory: Bool, excludedPaths: [Data], receiveChange: @escaping @Sendable () -> Void) {
         self.rootPath = rootPath
         self.relativePath = relativePath
         self.journalID = journalID
         self.excludedPaths = excludedPaths
+        self.receiveChange = receiveChange
         self.state = Mutex(JournalBufferState(dirtyDirectories: [], recursiveDirectories: [], requiresFullScan: requiresFullScan, eventID: eventID, historyDone: !expectsHistory, lastHistoryActivity: nil))
         self.historyFinished = DispatchSemaphore(value: 0)
     }
@@ -220,6 +226,7 @@ final class JournalEventBuffer: Sendable {
             return shouldSignal
         }
         if signalHistory { historyFinished.signal() }
+        if invalidPath || scopes.requiresFullScan || !scopes.dirtyDirectories.isEmpty || !scopes.recursiveDirectories.isEmpty { receiveChange() }
     }
 
     func snapshot() -> JournalReplay {
@@ -262,7 +269,11 @@ public final class FileEventJournal {
         try self.init(rootPath: rootPath, checkpoint: checkpoint, latency: latency, excludedPaths: [])
     }
 
-    public init(rootPath: String, checkpoint: JournalCheckpoint?, latency: TimeInterval, excludedPaths: [Data]) throws {
+    public convenience init(rootPath: String, checkpoint: JournalCheckpoint?, latency: TimeInterval, excludedPaths: [Data]) throws {
+        try self.init(rootPath: rootPath, checkpoint: checkpoint, latency: latency, excludedPaths: excludedPaths, receiveChange: {})
+    }
+
+    public init(rootPath: String, checkpoint: JournalCheckpoint?, latency: TimeInterval, excludedPaths: [Data], receiveChange: @escaping @Sendable () -> Void) throws {
         let normalizedRoot: String = URL(fileURLWithPath: rootPath).standardizedFileURL.path
         let identity: JournalIdentity = try journalIdentity(rootPath: normalizedRoot)
         let host: Bool = normalizedRoot == "/"
@@ -272,7 +283,7 @@ public final class FileEventJournal {
         let since: UInt64 = durableJournalID == nil ? UInt64(kFSEventStreamEventIdSinceNow) : (checkpointMatches ? checkpoint!.eventID : current)
         self.rootPath = normalizedRoot
         self.queue = DispatchQueue(label: "Disker.FileEventJournal", qos: .utility)
-        self.buffer = JournalEventBuffer(rootPath: normalizedRoot, relativePath: identity.relativePath, journalID: durableJournalID, eventID: since == UInt64(kFSEventStreamEventIdSinceNow) ? 0 : since, requiresFullScan: !checkpointMatches, expectsHistory: durableJournalID != nil, excludedPaths: excludedPaths)
+        self.buffer = JournalEventBuffer(rootPath: normalizedRoot, relativePath: identity.relativePath, journalID: durableJournalID, eventID: since == UInt64(kFSEventStreamEventIdSinceNow) ? 0 : since, requiresFullScan: !checkpointMatches, expectsHistory: durableJournalID != nil, excludedPaths: excludedPaths, receiveChange: receiveChange)
         var context: FSEventStreamContext = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(buffer).toOpaque(), retain: nil, release: nil, copyDescription: nil)
         let callback: FSEventStreamCallback = { _, context, count, paths, flags, identifiers in
             guard let context: UnsafeMutableRawPointer else { return }

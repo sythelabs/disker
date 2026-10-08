@@ -31,9 +31,11 @@ private func deliverJournalEvent(to buffer: JournalEventBuffer, path: String, fl
 struct FileEventJournalTests {
     @Test(arguments: ["fixture/cache", "fixture/cache/index.sqlite", "fixture/cache/index.sqlite-wal"])
     func excludedCacheEventsDoNotInvalidateTheirParent(path: String) {
-        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: false, excludedPaths: [Data("/fixture/cache".utf8)])
+        let notifications: Mutex<Int> = Mutex(0)
+        let buffer: JournalEventBuffer = JournalEventBuffer(rootPath: "/fixture", relativePath: "fixture", journalID: "journal", eventID: 10, requiresFullScan: false, expectsHistory: false, excludedPaths: [Data("/fixture/cache".utf8)], receiveChange: { notifications.withLock { $0 += 1 } })
         deliverJournalEvent(to: buffer, path: path, flags: UInt32(kFSEventStreamEventFlagItemIsDir | kFSEventStreamEventFlagItemModified), eventID: 11)
         #expect(!buffer.hasPendingChanges)
+        #expect(notifications.withLock { $0 } == 0)
         let replay: JournalReplay = buffer.snapshot()
         #expect(replay.dirtyDirectories.isEmpty)
         #expect(replay.recursiveDirectories.isEmpty)
@@ -43,6 +45,7 @@ struct FileEventJournalTests {
         #expect(buffer.hasPendingChanges)
         #expect(buffer.snapshot().dirtyDirectories == ["/fixture/cache-neighbor"])
         #expect(!buffer.hasPendingChanges)
+        #expect(notifications.withLock { $0 } == 1)
     }
 
     @Test func excludedPathsCannotSuppressDroppedEventReconciliation() {

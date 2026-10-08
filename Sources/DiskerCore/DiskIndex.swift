@@ -70,6 +70,70 @@ public actor DiskIndex {
         return try await pool.read { db in try cacheSummary(db, root: normalized) }
     }
 
+    public nonisolated func changes(root: String) async throws -> AsyncThrowingStream<Void, any Error> {
+        let requested: Data = Data(normalizedRoot(root).utf8)
+        let excluded: [Data] = cacheDirectories
+        let database: DatabasePool = pool
+        let (changes, output): (AsyncThrowingStream<Void, any Error>, AsyncThrowingStream<Void, any Error>.Continuation) = AsyncThrowingStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let (signals, signal): (AsyncStream<Void>, AsyncStream<Void>.Continuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let (attachment, attached): (AsyncThrowingStream<Void, any Error>, AsyncThrowingStream<Void, any Error>.Continuation) = AsyncThrowingStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let producer: Task<Void, Never> = Task.detached(priority: .utility) {
+            defer { signal.finish() }
+            do {
+                try Task.checkCancellation()
+                let locations: Set<Data> = try directoryLocations(path: requested)
+                let journal: FileEventJournal = try FileEventJournal(rootPath: "/", checkpoint: nil, latency: 0.05, excludedPaths: excluded, receiveChange: { signal.yield(()) })
+                defer { journal.stop() }
+                _ = try journal.replay(timeout: 10, isCancelled: { Task.isCancelled })
+                try Task.checkCancellation()
+                attached.yield(())
+                attached.finish()
+                for await _ in signals {
+                    try Task.checkCancellation()
+                    let replay: JournalReplay = try journal.takePending()
+                    let relevant: Bool
+                    if replay.requiresFullScan { relevant = true }
+                    else {
+                        relevant = try await database.read { db in
+                            let resolved: Data = try resolveCacheAlias(db, path: requested)
+                            var scopes: Set<Data> = locations
+                            scopes.insert(requested)
+                            scopes.insert(resolved)
+                            if let projection: CacheProjection = try cacheProjection(db, path: resolved, viewRoot: resolved) { scopes.formUnion(projection.scopes) }
+                            for path: String in replay.dirtyDirectories {
+                                let mapped: Set<Data> = try journalCachePaths(db, physical: Data(path.utf8))
+                                if mapped.contains(where: { candidate in scopes.contains(where: { cacheContains(candidate, in: $0) }) }) { return true }
+                            }
+                            for path: String in replay.recursiveDirectories {
+                                let mapped: Set<Data> = try journalCachePaths(db, physical: Data(path.utf8))
+                                if mapped.contains(where: { candidate in scopes.contains(where: { cacheContains(candidate, in: $0) || cacheContains($0, in: candidate) }) }) { return true }
+                            }
+                            return false
+                        }
+                    }
+                    if relevant { output.yield(()) }
+                }
+                output.finish()
+            } catch {
+                attached.finish(throwing: error)
+                output.finish(throwing: error)
+            }
+        }
+        output.onTermination = { _ in
+            producer.cancel()
+            signal.finish()
+        }
+        return try await withTaskCancellationHandler {
+            var readiness: AsyncThrowingStream<Void, any Error>.Iterator = attachment.makeAsyncIterator()
+            guard try await readiness.next() != nil else { throw CancellationError() }
+            try Task.checkCancellation()
+            return changes
+        } onCancel: {
+            producer.cancel()
+            signal.finish()
+        }
+    }
+
     public nonisolated func node(root: String, path: Data) async throws -> IndexedNode? {
         let normalized: String = normalizedRoot(root)
         guard cacheContains(path, in: Data(normalized.utf8)) else { return nil }

@@ -416,7 +416,7 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         try treeFiles(directory: trash, count: 2, bytes: 4_096)
         _ = try await cachedTree(fixture: fixture)
         let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
-        defer { model.cancelScan() }
+        defer { model.stop() }
         await model.start()
         try await waitForTreeScan(model)
         await model.toggle(trashPath)
@@ -443,6 +443,86 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.summary?.nodeCount == 3)
         #expect(model.expanded.contains(trashPath))
         #expect(model.errorMessage == nil)
+    }
+
+    @Test func stoppedModelReattachesItsWatcherWhenStartedAgain() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root, count: 1, bytes: 4_096)
+        _ = try await cachedTree(fixture: fixture)
+        let started: Mutex<Int> = Mutex(0)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            if case .started = event { started.withLock { $0 += 1 } }
+        })
+        defer { model.stop() }
+        await model.start()
+        try await waitForTreeScan(model)
+        model.stop()
+        let previousStarts: Int = started.withLock { $0 }
+        try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("file-0"))
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(started.withLock { $0 } == previousStarts)
+        #expect(model.summary?.logicalBytes == 4_096)
+        await model.start()
+        try await waitForTreeScan(model)
+        #expect(model.summary?.logicalBytes == 0)
+        #expect(model.summary?.nodeCount == 1)
+        let added: URL = fixture.root.appendingPathComponent("added")
+        try Data(repeating: 1, count: 128).write(to: added)
+        let deadline: Date = Date().addingTimeInterval(5)
+        while model.summary?.logicalBytes != 128 && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(model.rows.contains { $0.id == .node(Data(added.path.utf8)) })
+        #expect(model.summary?.logicalBytes == 128)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test func retargetedWatcherKeepsRowsInTheNewRootAndObservesItsChanges() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root, count: 1, bytes: 4_096)
+        let other: URL = fixture.container.appendingPathComponent("other")
+        try treeFiles(directory: other, count: 1, bytes: 128)
+        let index: DiskIndex = try await cachedTree(fixture: fixture)
+        _ = try await index.refresh(root: other.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        defer { model.stop() }
+        await model.start()
+        try await waitForTreeScan(model)
+        await model.chooseRoot(other)
+        try await waitForTreeScan(model)
+        try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("file-0"))
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(model.rootPath == other.path)
+        #expect(model.summary?.logicalBytes == 128)
+        #expect(model.summary?.nodeCount == 2)
+        #expect(model.rows.allSatisfy { row in
+            guard let node: IndexedNode = row.node else { return false }
+            return node.entry.path == Data(other.path.utf8) || node.entry.path.starts(with: Data((other.path + "/").utf8))
+        })
+        try FileManager.default.removeItem(at: other.appendingPathComponent("file-0"))
+        let deadline: Date = Date().addingTimeInterval(5)
+        while model.summary?.nodeCount != 1 && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(model.summary?.root == other.path)
+        #expect(model.summary?.logicalBytes == 0)
+        #expect(model.summary?.nodeCount == 1)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test func idleWatcherDoesNotRetainItsTreeModel() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root, count: 1, bytes: 128)
+        _ = try await cachedTree(fixture: fixture)
+        weak var retained: DiskTreeModel?
+        do {
+            let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+            retained = model
+            await model.start()
+            try await waitForTreeScan(model)
+        }
+        let deadline: Date = Date().addingTimeInterval(1)
+        while retained != nil && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(retained == nil, "The idle watcher keeps the model alive across its next awaited event")
     }
 
     @Test func nestedFoldersAndFilesCollapseAndReexpandWithParentProportions() async throws {

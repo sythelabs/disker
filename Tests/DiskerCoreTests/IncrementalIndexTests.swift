@@ -371,6 +371,63 @@ struct IncrementalIndexTests {
         #expect(summary.issues.contains { $0.kind == .excluded && $0.path == Data(fixture.root.appendingPathComponent("cache").path.utf8) })
     }
 
+    @Test func changeStreamIsAttachedBeforeReturning() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let changes: AsyncThrowingStream<Void, any Error> = try await index.changes(root: fixture.root.path)
+        let received: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let observer: Task<Void, Never> = Task {
+            do {
+                for try await _ in changes { received.signal() }
+            } catch {
+                if !Task.isCancelled { Issue.record(error) }
+            }
+        }
+        defer { observer.cancel() }
+        let created: URL = fixture.root.appendingPathComponent("created-after-attachment")
+        try Data(repeating: 1, count: 1_024).write(to: created)
+        #expect(await waitForIncrementalSignal(received, timeout: .now() + 5) == .success)
+        observer.cancel()
+        await observer.value
+    }
+
+    @Test func changeStreamIgnoresCacheAndSiblingWritesThroughSymlinkPaths() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        try createIncrementalFiles(directory: fixture.root, count: 1, bytes: 1_024)
+        let alias: URL = fixture.container.appendingPathComponent("root-alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.root)
+        let index: DiskIndex = try DiskIndex(databaseURL: alias.appendingPathComponent("cache/index.sqlite"))
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        let changes: AsyncThrowingStream<Void, any Error> = try await index.changes(root: fixture.root.path)
+        let notifications: Mutex<Int> = Mutex(0)
+        let received: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let observer: Task<Void, Never> = Task {
+            do {
+                for try await _ in changes {
+                    notifications.withLock { $0 += 1 }
+                    received.signal()
+                }
+            } catch {
+                if !Task.isCancelled { Issue.record(error) }
+            }
+        }
+        defer { observer.cancel() }
+        _ = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        try mutateAfterJournalFence(root: fixture.container, requiredDirectories: [fixture.container.path]) {
+            try Data(repeating: 3, count: 512).write(to: fixture.container.appendingPathComponent("unrelated-sibling"))
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(notifications.withLock { $0 } == 0)
+        try Data(repeating: 2, count: 2_048).write(to: fixture.root.appendingPathComponent("file-0"))
+        #expect(await waitForIncrementalSignal(received, timeout: .now() + 5) == .success)
+        #expect(notifications.withLock { $0 } > 0)
+        observer.cancel()
+        await observer.value
+    }
+
     @Test func cachedQueriesFinishWhileRefreshHasUncommittedStreamingBatches() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }

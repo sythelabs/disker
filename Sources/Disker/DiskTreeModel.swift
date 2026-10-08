@@ -103,6 +103,9 @@ final class DiskTreeModel {
     @ObservationIgnored private var sortGeneration: UInt64 = 0
     @ObservationIgnored private var scanTask: Task<Void, Never>?
     @ObservationIgnored private var scanBuffer: TreeScanBuffer?
+    @ObservationIgnored private var watcherTask: Task<Void, Never>?
+    @ObservationIgnored private var watcherGeneration: UInt64 = 0
+    @ObservationIgnored private var pendingAutomaticRefresh: Bool = false
     private let pageSize: Int = 500
 
     convenience init(rootURL: URL, cacheURL: URL) {
@@ -116,6 +119,8 @@ final class DiskTreeModel {
         self.cacheURL = cacheURL
         self.receiveScanEvent = receiveScanEvent
     }
+
+    deinit { watcherTask?.cancel() }
 
     var rows: [DiskTreeRow] {
         guard let rootNode else { return [] }
@@ -138,19 +143,84 @@ final class DiskTreeModel {
     var canGoForward: Bool { !forwardPaths.isEmpty }
 
     func start() async {
-        if index != nil { return }
+        if watcherTask != nil { return }
         let ticket: UInt64 = generation
+        var watching: UInt64 = watcherGeneration
         let database: URL = cacheURL
         do {
-            let opened: DiskIndex = try await DiskIndex.open(databaseURL: database)
-            guard ticket == generation, !Task.isCancelled else { return }
+            await scanTask?.value
+            let opened: DiskIndex
+            if let index { opened = index }
+            else { opened = try await DiskIndex.open(databaseURL: database) }
+            guard ticket == generation, watching == watcherGeneration, !Task.isCancelled else { return }
             index = opened
             try await reloadSnapshot(ticket: ticket)
-            guard ticket == generation, !Task.isCancelled else { return }
+            guard ticket == generation, watching == watcherGeneration, !Task.isCancelled else { return }
+            watching += 1
+            let attached: UInt64 = try await watchChanges(index: opened)
+            guard ticket == generation, attached == watcherGeneration, !Task.isCancelled else { return }
             refresh()
         } catch {
-            if ticket == generation { errorMessage = String(describing: error) }
+            if ticket == generation, watching == watcherGeneration, !Task.isCancelled, !(error is CancellationError) { errorMessage = String(describing: error) }
         }
+    }
+
+    private func watchChanges(index: DiskIndex) async throws -> UInt64 {
+        watcherGeneration += 1
+        let ticket: UInt64 = watcherGeneration
+        let root: String = rootPath
+        try await withCheckedThrowingContinuation { (ready: CheckedContinuation<Void, any Error>) in
+            watcherTask = Task { [weak self] in
+                let changes: AsyncThrowingStream<Void, any Error>
+                do { changes = try await index.changes(root: root) }
+                catch {
+                    if let self, ticket == self.watcherGeneration { self.watcherTask = nil }
+                    ready.resume(throwing: error)
+                    return
+                }
+                guard !Task.isCancelled, self?.watcherGeneration == ticket else {
+                    ready.resume(throwing: CancellationError())
+                    return
+                }
+                ready.resume()
+                do {
+                    for try await _ in changes {
+                        guard !Task.isCancelled, let self, ticket == self.watcherGeneration else { return }
+                        self.requestAutomaticRefresh()
+                    }
+                    if !Task.isCancelled, let self, ticket == self.watcherGeneration {
+                        self.watcherTask = nil
+                        self.errorMessage = String(describing: FileEventJournalError.stopped(root))
+                    }
+                } catch {
+                    if !Task.isCancelled, let self, ticket == self.watcherGeneration {
+                        self.watcherTask = nil
+                        self.errorMessage = String(describing: error)
+                    }
+                }
+            }
+        }
+        return ticket
+    }
+
+    private func requestAutomaticRefresh() {
+        guard scanBuffer?.isCancelled != true else { return }
+        if isScanning { pendingAutomaticRefresh = true }
+        else { beginScan(mode: .automatic) }
+    }
+
+    private func stopWatching() -> Task<Void, Never>? {
+        let previous: Task<Void, Never>? = watcherTask
+        watcherGeneration += 1
+        watcherTask = nil
+        pendingAutomaticRefresh = false
+        previous?.cancel()
+        return previous
+    }
+
+    func stop() {
+        cancelScan()
+        _ = stopWatching()
     }
 
     func chooseRoot(_ url: URL) async {
@@ -174,11 +244,13 @@ final class DiskTreeModel {
     }
 
     private func loadRoot(_ path: String) async {
+        let previousWatcher: Task<Void, Never>? = stopWatching()
         cancelScan()
         generation += 1
         let navigation: UInt64 = generation
         let previous: Task<Void, Never>? = scanTask
         await previous?.value
+        await previousWatcher?.value
         guard navigation == generation else { return }
         isScanning = false
         isWaitingForWriter = false
@@ -193,13 +265,17 @@ final class DiskTreeModel {
         summary = nil
         errorMessage = nil
         scanStopped = false
-        guard index != nil else { await start(); return }
+        guard let index else { await start(); return }
         let ticket: UInt64 = generation
+        var watching: UInt64 = watcherGeneration
         do {
             try await reloadSnapshot(ticket: ticket)
-            if ticket == generation { refresh() }
+            guard ticket == generation, watching == watcherGeneration else { return }
+            watching += 1
+            let attached: UInt64 = try await watchChanges(index: index)
+            if ticket == generation, attached == watcherGeneration { refresh() }
         } catch {
-            if ticket == generation { errorMessage = String(describing: error) }
+            if ticket == generation, watching == watcherGeneration, !Task.isCancelled, !(error is CancellationError) { errorMessage = String(describing: error) }
         }
     }
 
@@ -218,6 +294,7 @@ final class DiskTreeModel {
 
     private func beginScan(mode: RefreshMode) {
         guard let index, !isScanning else { return }
+        pendingAutomaticRefresh = false
         generation += 1
         let ticket: UInt64 = generation
         let root: String = rootPath
@@ -262,6 +339,7 @@ final class DiskTreeModel {
                 scanProgress = 1
             } catch ScanError.cancelled {
                 guard ticket == generation else { return }
+                pendingAutomaticRefresh = false
                 scanStopped = true
                 do { try await reloadSnapshot(ticket: ticket) } catch { errorMessage = String(describing: error) }
             } catch {
@@ -274,10 +352,12 @@ final class DiskTreeModel {
             isWaitingForWriter = false
             scanTask = nil
             scanBuffer = nil
+            if pendingAutomaticRefresh { beginScan(mode: .automatic) }
         }
     }
 
     func cancelScan() {
+        pendingAutomaticRefresh = false
         scanBuffer?.cancel()
         isWaitingForWriter = false
     }

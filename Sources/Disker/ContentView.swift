@@ -120,7 +120,7 @@ struct ContentView: View {
             do { clipboardItems = try operations.files(on: .general) }
             catch { fileOperationError = error.localizedDescription }
         }
-        .onDisappear { model.cancelScan() }
+        .onDisappear { model.stop() }
         .onChange(of: model.rootPath) { _, _ in
             model.selection = []
             searchText = ""
