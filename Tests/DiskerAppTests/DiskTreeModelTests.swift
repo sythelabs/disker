@@ -407,6 +407,52 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.expanded.contains(Data(folder.path.utf8)))
     }
 
+    @Test func fileOperationRefreshReturnsWhileLaterAutomaticScansContinue() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        try treeFiles(directory: fixture.root, count: 1, bytes: 128)
+        _ = try await cachedTree(fixture: fixture)
+        let armed: Mutex<Bool> = Mutex(false)
+        let started: Mutex<Int> = Mutex(0)
+        let entered: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let returned: Mutex<Bool> = Mutex(false)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache, receiveScanEvent: { event in
+            guard case .started = event, armed.withLock({ $0 }) else { return }
+            let wave: Int = started.withLock { count in
+                count += 1
+                return count
+            }
+            guard wave <= 3 else { return }
+            entered.signal()
+            if release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing automatic refresh wave") }
+        })
+        defer { model.stop(); release.signal() }
+        await model.start()
+        try await waitForTreeScan(model)
+        armed.withLock { $0 = true }
+        let operation: Task<Void, Never> = Task {
+            await model.refreshDirectories([Data(fixture.root.path.utf8)])
+            returned.withLock { $0 = true }
+        }
+        for bytes: Int in [256, 384] {
+            try #require(await waitForTreeSignal(entered, timeout: .now() + 5) == .success)
+            #expect(model.isScanning)
+            try Data(repeating: 2, count: bytes).write(to: fixture.root.appendingPathComponent("file-0"))
+            try await Task.sleep(for: .milliseconds(300))
+            release.signal()
+        }
+        try #require(await waitForTreeSignal(entered, timeout: .now() + 5) == .success)
+        let deadline: Date = Date().addingTimeInterval(1)
+        while !returned.withLock({ $0 }) && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(returned.withLock { $0 }, "A completed file operation waits for unrelated later automatic scans")
+        #expect(model.isScanning)
+        #expect(model.summary?.logicalBytes == 384)
+        model.stop()
+        release.signal()
+        await operation.value
+    }
+
     @Test func externalTrashDeletionUpdatesExpandedRowsWithoutManualRefresh() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
