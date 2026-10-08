@@ -291,10 +291,11 @@ final class DiskTreeModel {
         await scanTask?.value
         guard ticket == generation, watching == watcherGeneration, !Task.isCancelled else { return }
         beginScan(mode: .directories(directories))
-        while let pending: Task<Void, Never> = scanTask {
-            await pending.value
-            guard watching == watcherGeneration, !Task.isCancelled else { return }
-        }
+        let requested: Task<Void, Never>? = scanTask
+        await requested?.value
+        guard watching == watcherGeneration, !Task.isCancelled else { return }
+        let followup: Task<Void, Never>? = scanTask
+        await followup?.value
     }
 
     private func beginScan(mode: RefreshMode) {
