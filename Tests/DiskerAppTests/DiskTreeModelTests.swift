@@ -407,6 +407,44 @@ private func waitForTreeSignal(_ signal: DispatchSemaphore, timeout: DispatchTim
         #expect(model.expanded.contains(Data(folder.path.utf8)))
     }
 
+    @Test func externalTrashDeletionUpdatesExpandedRowsWithoutManualRefresh() async throws {
+        let fixture: TreeFixture = try treeFixture()
+        defer { removeTreeFixture(fixture) }
+        let trash: URL = fixture.root.appendingPathComponent(".Trash")
+        let trashPath: Data = Data(trash.path.utf8)
+        try treeFiles(directory: fixture.root, count: 1, bytes: 1_024)
+        try treeFiles(directory: trash, count: 2, bytes: 4_096)
+        _ = try await cachedTree(fixture: fixture)
+        let model: DiskTreeModel = DiskTreeModel(rootURL: fixture.root, cacheURL: fixture.cache)
+        defer { model.cancelScan() }
+        await model.start()
+        try await waitForTreeScan(model)
+        await model.toggle(trashPath)
+        let removed: [URL] = (0..<2).map { trash.appendingPathComponent("file-\($0)") }
+        let removedIDs: Set<DiskTreeRowID> = Set(removed.map { .node(Data($0.path.utf8)) })
+        try #require(removedIDs.isSubset(of: Set(model.rows.map(\.id))))
+        try #require(model.summary?.logicalBytes == 9_216)
+        try #require(model.summary?.nodeCount == 5)
+        for url: URL in removed { try FileManager.default.removeItem(at: url) }
+
+        let deadline: Date = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let trashNode: IndexedNode? = model.rows.first { $0.id == .node(trashPath) }?.node
+            if removedIDs.isDisjoint(with: Set(model.rows.map(\.id))),
+               trashNode?.subtreeLogicalBytes == 0, trashNode?.subtreeNodeCount == 1,
+               model.summary?.logicalBytes == 1_024, model.summary?.nodeCount == 3 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(removedIDs.isDisjoint(with: Set(model.rows.map(\.id))), "Externally emptied Trash retains deleted children until a manual refresh")
+        let trashNode: IndexedNode = try #require(model.rows.first { $0.id == .node(trashPath) }?.node)
+        #expect(trashNode.subtreeLogicalBytes == 0)
+        #expect(trashNode.subtreeNodeCount == 1)
+        #expect(model.summary?.logicalBytes == 1_024)
+        #expect(model.summary?.nodeCount == 3)
+        #expect(model.expanded.contains(trashPath))
+        #expect(model.errorMessage == nil)
+    }
+
     @Test func nestedFoldersAndFilesCollapseAndReexpandWithParentProportions() async throws {
         let fixture: TreeFixture = try treeFixture()
         defer { removeTreeFixture(fixture) }
