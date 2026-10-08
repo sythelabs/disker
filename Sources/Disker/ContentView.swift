@@ -478,13 +478,14 @@ struct LastOpenedDateCell: View {
     let read: @MainActor (Data) async throws -> Date?
 
     var body: some View {
-        LastOpenedDateValue(path: path, read: read)
-            .id(revision)
+        LastOpenedDateValue(path: path, revision: revision, read: read)
+            .id(path)
     }
 }
 
 private struct LastOpenedDateValue: View {
     let path: Data
+    let revision: Int64?
     let read: @MainActor (Data) async throws -> Date?
     @State private var date: Date?
     @State private var errorMessage: String?
@@ -493,7 +494,7 @@ private struct LastOpenedDateValue: View {
         Text(lastOpenedLabel(date))
             .lineLimit(1)
             .help(errorMessage ?? (date == nil ? "Date last opened unavailable" : lastOpenedLabel(date)))
-            .task(id: path) {
+            .task(id: revision) {
                 do {
                     let opened: Date? = try await read(path)
                     guard !Task.isCancelled else { return }
