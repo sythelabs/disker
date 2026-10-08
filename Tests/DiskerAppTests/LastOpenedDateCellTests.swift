@@ -54,10 +54,7 @@ enum DateCellOutcome: CaseIterable {
         guard let continuation: CheckedContinuation<Date?, any Error> = pending.removeValue(forKey: index) else {
             throw DateCellTestError.missingRequest(index)
         }
-        switch result {
-        case .success(let date): continuation.resume(returning: date)
-        case .failure(let error): continuation.resume(throwing: error)
-        }
+        continuation.resume(with: result)
     }
 
     func finishPending() {
