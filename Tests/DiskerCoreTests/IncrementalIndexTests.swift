@@ -537,6 +537,81 @@ struct IncrementalIndexTests {
         #expect(try await index.children(root: fixture.root.path, directory: Data(replaced.path.utf8), offset: 0, limit: 10).isEmpty)
     }
 
+    @Test func deletingPreviouslyScannedTrashUpdatesCachedRowsBeforeScanFinishes() async throws {
+        let fixture: IncrementalFixture = try incrementalFixture()
+        defer { removeIncrementalFixture(fixture) }
+        let trash: URL = fixture.root.appendingPathComponent(".Trash")
+        let trigger: URL = fixture.root.appendingPathComponent("zzzzzz-trigger")
+        let later: URL = fixture.root.appendingPathComponent("zzzzzzzzzzzzzzzz-pause")
+        try createIncrementalFiles(directory: trash, count: 2, bytes: 4_096)
+        try createIncrementalFiles(directory: trigger, count: 1, bytes: 3)
+        try createIncrementalFiles(directory: later, count: 1, bytes: 5)
+        let trashPath: Data = Data(trash.path.utf8)
+        let triggerPath: Data = Data(trigger.path.utf8)
+        let laterPath: Data = Data(later.path.utf8)
+        let index: DiskIndex = try DiskIndex(databaseURL: fixture.database)
+        let initial: IndexSummary = try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { _ in }, isCancelled: { false })
+        let initialTrash: IndexedNode = try #require(try await index.node(root: fixture.root.path, path: trashPath))
+        _ = try await unchangedSummary(index: index, root: fixture.root.path)
+        let trashScanned: Mutex<Bool> = Mutex(false)
+        let mutated: Mutex<Bool> = Mutex(false)
+        let paused: Mutex<Bool> = Mutex(false)
+        let entered: DispatchSemaphore = DispatchSemaphore(value: 0)
+        let release: DispatchSemaphore = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let refresh: Task<IndexSummary, any Error> = Task.detached(priority: .utility) {
+            try await index.refresh(root: fixture.root.path, mode: .full, receiveEvent: { event in
+                guard case .batch(let batch) = event else { return }
+                if batch.contains(where: { $0.parentPath == trashPath }) { trashScanned.withLock { $0 = true } }
+                if batch.contains(where: { $0.parentPath == triggerPath }) {
+                    let shouldMutate: Bool = mutated.withLock { state in
+                        if state { return false }
+                        state = true
+                        return true
+                    }
+                    if shouldMutate {
+                        #expect(trashScanned.withLock { $0 })
+                        do {
+                            try mutateAfterJournalFence(root: fixture.root, requiredDirectories: [trash.path]) {
+                                try FileManager.default.removeItem(at: trash.appendingPathComponent("file-0"))
+                                try FileManager.default.removeItem(at: trash.appendingPathComponent("file-1"))
+                            }
+                        } catch { Issue.record(error) }
+                    }
+                }
+                guard batch.contains(where: { $0.parentPath == laterPath }) else { return }
+                let shouldPause: Bool = paused.withLock { state in
+                    if state { return false }
+                    state = true
+                    return true
+                }
+                if shouldPause {
+                    entered.signal()
+                    if release.wait(timeout: .now() + 10) == .timedOut { Issue.record("Timed out releasing scan after Trash deletion") }
+                }
+            }, isCancelled: { false })
+        }
+        let scanPaused: DispatchTimeoutResult = await waitForIncrementalSignal(entered, timeout: .now() + 10)
+        #expect(scanPaused == .success)
+        #expect(mutated.withLock { $0 })
+        let children: [IndexedNode] = try await index.children(root: fixture.root.path, directory: trashPath, offset: 0, limit: 10)
+        let trashDuringScan: IndexedNode? = try await index.node(root: fixture.root.path, path: trashPath)
+        let summaryDuringScan: IndexSummary? = try await index.cachedSummary(root: fixture.root.path)
+        #expect(children.isEmpty)
+        #expect(trashDuringScan?.subtreeLogicalBytes == 0)
+        #expect(trashDuringScan?.subtreeNodeCount == 1)
+        #expect((trashDuringScan?.subtreeAllocatedBytes ?? initialTrash.subtreeAllocatedBytes) < initialTrash.subtreeAllocatedBytes)
+        #expect(summaryDuringScan?.logicalBytes == 8)
+        #expect(summaryDuringScan?.nodeCount == 6)
+        #expect((summaryDuringScan?.allocatedBytes ?? initial.allocatedBytes) < initial.allocatedBytes)
+        #expect(summaryDuringScan?.isComplete == false)
+        release.signal()
+        let final: IndexSummary = try await refresh.value
+        #expect(final.logicalBytes == 8)
+        #expect(final.nodeCount == 6)
+        #expect(final.isComplete)
+    }
+
     @Test func deletionAfterFirstStreamingBatchDoesNotLeaveAStaleRow() async throws {
         let fixture: IncrementalFixture = try incrementalFixture()
         defer { removeIncrementalFixture(fixture) }
