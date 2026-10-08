@@ -286,11 +286,15 @@ final class DiskTreeModel {
 
     func refreshDirectories(_ directories: [Data]) async {
         let ticket: UInt64 = generation
+        let watching: UInt64 = watcherGeneration
         cancelScan()
         await scanTask?.value
-        guard ticket == generation else { return }
+        guard ticket == generation, watching == watcherGeneration, !Task.isCancelled else { return }
         beginScan(mode: .directories(directories))
-        await scanTask?.value
+        while let pending: Task<Void, Never> = scanTask {
+            await pending.value
+            guard watching == watcherGeneration, !Task.isCancelled else { return }
+        }
     }
 
     private func beginScan(mode: RefreshMode) {
