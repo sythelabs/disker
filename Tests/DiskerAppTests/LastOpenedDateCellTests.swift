@@ -26,7 +26,7 @@ enum DateCellOutcome: CaseIterable {
     case unavailable
     case failure
 
-    var result: Result<Date?, DateCellTestError> {
+    fileprivate var result: Result<Date?, DateCellTestError> {
         switch self {
         case .unchanged: return .success(Date(timeIntervalSince1970: 1_000_000))
         case .changed: return .success(Date(timeIntervalSince1970: 2_000_000))
