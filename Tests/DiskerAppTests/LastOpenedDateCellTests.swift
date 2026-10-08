@@ -20,7 +20,7 @@ private enum DateCellTestError: Error, LocalizedError {
     }
 }
 
-private enum DateCellOutcome: CaseIterable {
+enum DateCellOutcome: CaseIterable {
     case unchanged
     case changed
     case unavailable
