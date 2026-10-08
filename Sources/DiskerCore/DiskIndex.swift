@@ -327,14 +327,24 @@ public actor DiskIndex {
         try publishProgress()
         var settled: Bool = false
         for _: Int in 0..<8 {
+            var furthest: Data?
+            var liveReplaysWithoutProgress: Int = 0
             while let path: Data = try await pool.read({ db in
                 try pendingCacheDirectory(db, root: rootPath)
             }) {
                 if isCancelled() { throw ScanError.cancelled }
+                let advances: Bool = furthest.map { previous in
+                    path.count > previous.count || (path.count == previous.count && previous.lexicographicallyPrecedes(path))
+                } ?? true
+                if advances {
+                    furthest = path
+                    liveReplaysWithoutProgress = 0
+                }
                 let report: ScanSummary = try await enumerate(path: path, options: options, receiveEvent: receiveEvent, publishProgress: publishProgress, isCancelled: isCancelled)
                 metrics = addMetrics(metrics, report.metrics)
                 try publishProgress()
-                if journal.hasPendingChanges {
+                if liveReplaysWithoutProgress < 8, journal.hasPendingChanges {
+                    liveReplaysWithoutProgress += 1
                     let pending: JournalReplay = try journal.takePending()
                     try await pool.write { db in
                         _ = try beginCacheChanges(db)
