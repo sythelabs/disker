@@ -10,8 +10,9 @@ permissions:
 
 jobs:
   version-increase:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: Version increase
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, ci]
     steps:
       - uses: actions/checkout@v6
       - name: Test the version gate

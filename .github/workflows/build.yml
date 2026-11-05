@@ -17,7 +17,8 @@ concurrency:
 jobs:
   build-and-test:
     name: Build and test
-    runs-on: macos-26
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 30
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
@@ -103,7 +104,7 @@ jobs:
     name: Publish release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-test
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, ci]
     permissions:
       contents: write
     steps:
