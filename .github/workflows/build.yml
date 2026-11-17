@@ -17,16 +17,38 @@ concurrency:
 jobs:
   build-and-test:
     name: Build and test
-    runs-on: macos-26
-    timeout-minutes: 30
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: mac-mini-swift
+    timeout-minutes: 60
     outputs:
       version: ${{ steps.package.outputs.version }}
     steps:
       - uses: actions/checkout@v6
-      - name: Install just
-        run: brew install just uv
+      - name: Install tools in a job-private home
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d "$RUNNER_TEMP/disker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+          mkdir -p "$home/bin" "$home/home"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://github.com/casey/just/releases/download/1.59.0/just-1.59.0-aarch64-apple-darwin.tar.gz \
+            | tar -xz -C "$home/bin" just
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://github.com/astral-sh/uv/releases/download/0.13.0/uv-installer.sh \
+            | env UV_UNMANAGED_INSTALL="$home/bin" sh
+          export UV_PYTHON_INSTALL_DIR="$home/python" UV_CACHE_DIR="$home/cache"
+          "$home/bin/uv" python install 3.12
+          interpreter="$("$home/bin/uv" python find 3.12)"
+          {
+            echo "HOME=$home/home"
+            echo "UV_PYTHON_INSTALL_DIR=$UV_PYTHON_INSTALL_DIR"
+            echo "UV_CACHE_DIR=$UV_CACHE_DIR"
+            echo "UV_PYTHON=3.12"
+            echo "DEVELOPER_DIR=$(xcode-select -p)"
+          } >> "$GITHUB_ENV"
+          echo "$home/bin" >> "$GITHUB_PATH"
+          dirname "$interpreter" >> "$GITHUB_PATH"
+          xcodebuild -version
+          swift --version
       - name: Test
         run: just test
       - name: Build the universal release app
@@ -98,12 +120,17 @@ jobs:
           path: dist/
           if-no-files-found: error
           compression-level: 0
+      - name: Remove this job's private tools and build output
+        if: ${{ always() }}
+        run: |
+          rm -rf "$RUNNER_TEMP"/disker-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"-*
+          git clean -ffdxq
 
   publish:
     name: Publish release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-test
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, ci]
     permissions:
       contents: write
     steps:
